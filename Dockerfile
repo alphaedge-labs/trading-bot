@@ -9,8 +9,9 @@ COPY . .
 
 ENV PYTHONPATH=/app/src
 
+RUN pip install "git+https://github.com/Kotak-Neo/kotak-neo-api.git#egg=neo_api_client"
+
 RUN pip install --no-deps -r requirements.txt
+EXPOSE 8001
 
-EXPOSE 8000
-
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port $PORT"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port $PORT"]

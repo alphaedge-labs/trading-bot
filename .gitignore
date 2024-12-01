@@ -11,3 +11,5 @@ sdist/
 # database files
 *.db
 *.db-journal
+
+*.log

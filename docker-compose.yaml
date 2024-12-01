@@ -1,92 +1,44 @@
-version: '3.8'
-
 services:
-  fastapi:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: alphaedge_fastapi
-    ports:
-      - '${PORT}:${PORT}'
-    environment:
-      - HOST=$HOST
-      - PORT=$PORT
-      - DATABASE_URL=$DATABASE_URL
-      - MONGODB_URL=$MONGODB_URL
-      - MONGODB_DATABASE=$MONGODB_DATABASE
-      - TWITTER_API_KEY=$TWITTER_API_KEY
-      - TWITTER_API_SECRET_KEY=$TWITTER_API_SECRET_KEY
-      - TWITTER_ACCESS_TOKEN=$TWITTER_ACCESS_TOKEN
-      - TWITTER_BEARER_TOKEN=$TWITTER_BEARER_TOKEN
-      - TWITTER_BASE_URL=$TWITTER_BASE_URL
-      - WEBSOCKET_HOST=$WEBSOCKET_HOST
-      - WEBSOCKET_PORT=$WEBSOCKET_PORT
-      - SQLITE_DB_PATH=$SQLITE_DB_PATH
-      - REDIS_HOST=$REDIS_HOST
-      - REDIS_PORT=$REDIS_PORT
-      - RABBITMQ_HOST=$RABBITMQ_HOST
-      - RABBITMQ_USER=$RABBITMQ_USER
-      - RABBITMQ_PASS=$RABBITMQ_PASS
-    volumes:
-      - .:/app
-    depends_on:
-      - rabbitmq
-      - sqlite
-      - redis
-    restart: always
-    networks:
-      - app_network
-
-  rabbitmq:
-    image: rabbitmq:3-management
-    container_name: alphaedge_rabbitmq
-    ports:
-      - '5672:5672'
-      - '15672:15672'
-    environment:
-      - RABBITMQ_DEFAULT_USER=$RABBITMQ_USER
-      - RABBITMQ_DEFAULT_PASS=$RABBITMQ_PASS
-    networks:
-      - app_network
-
-  sqlite:
-    image: nouchka/sqlite3
-    container_name: alphaedge_sqlite
-    environment:
-      - SQLITE_DATABASE=$SQLITE_DATABASE
-    volumes:
-      - sqlite_data:/data
-    networks:
-      - app_network
-
-  redis:
-    image: redis:alpine
-    container_name: alphaedge_redis
-    ports:
-      - '${REDIS_PORT}:${REDIS_PORT}'
-    networks:
-      - app_network
-
-  mq_worker:
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
-    container_name: alphaedge_mqworker
-    depends_on:
-      - rabbitmq
-      - fastapi
-    environment:
-      - RABBITMQ_HOST=$RABBITMQ_HOST
-      - RABBITMQ_USER=$RABBITMQ_USER
-      - RABBITMQ_PASS=$RABBITMQ_PASS
-      - HOST=$HOST
-      - PORT=$PORT
-    networks:
-      - app_network
+    alphaedge__trading_bot:
+        build:
+            context: .
+            dockerfile: Dockerfile
+        container_name: alphaedge__trading_bot
+        image: alphaedge__trading_bot:latest
+        ports:
+            - "${PORT}:${PORT}"
+        env_file:
+            - .env
+        volumes:
+            - .:/app
+        restart: on-failure
+        networks:
+            - alphaedge__network
+        healthcheck:
+            test:
+                [
+                    "CMD-SHELL",
+                    "curl -f --fail-on-error --silent --head http://localhost:${PORT}/health || exit 1",
+                ]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 60s
+        logging:
+            driver: "json-file"
+            options:
+                max-size: "10m"
+                max-file: "3"
+        deploy:
+            resources:
+                limits:
+                    cpus: "0.5" # Use half of the available CPU
+                    memory: 256M # Limit memory to 256 MB
+                reservations:
+                    cpus: "0.25" # Reserve 25% of the available CPU
+                    memory: 128M # Reserve 128 MB memory
 
 networks:
-  app_network:
-    driver: bridge
-
-volumes:
-  sqlite_data:
+    alphaedge__network:
+        driver: bridge
+        external: true
