@@ -1,4 +1,4 @@
-from app.brokers.base_broker import BaseBroker
+from brokers.base_broker import BaseBroker
 from neo_api_client import NeoAPI
 from typing import Dict, Any, Optional
 

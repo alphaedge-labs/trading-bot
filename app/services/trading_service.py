@@ -1,10 +1,11 @@
 import asyncio
 from loguru import logger
 from typing import Optional, Dict
-from app.database.redis import redis_client
-from app.database.mongodb import db
-from app.brokers.kotak_neo import KotakNeo
-from app.models.user import User
+from database.redis import redis_client
+from database.mongodb import db
+from brokers.kotak_neo import KotakNeo
+from models.user import User
+from constants.brokers import Broker
 
 class TradingService:
     def __init__(self):
@@ -30,11 +31,13 @@ class TradingService:
         """Load all active users from MongoDB and initialize their data in Redis"""
         try:
             users_collection = db['users']
-            async for user_data in users_collection.find({"trading_config.is_active": True}):
+            active_users = users_collection.find({"trading_config.is_active": True}).to_list(length=None)
+
+            for user_data in active_users:
                 user = User(**user_data)
                 
                 # Initialize broker instance for user
-                if user.broker_name == "kotak_neo":
+                if user.broker_name == Broker.KOTAK_NEO:
                     broker = KotakNeo(
                         client_id=user.broker_credentials["client_id"],
                         client_secret=user.broker_credentials["client_secret"]
@@ -48,7 +51,7 @@ class TradingService:
                 }
                 
                 # Initialize user data in Redis
-                self.redis.set_hash("users", user.user_id, {
+                await self.redis.set_hash("users", user.user_id, {
                     "max_capital": str(user.trading_config.max_capital),
                     "used_capital": "0",
                     "max_risk_per_trade": str(user.trading_config.max_risk_per_trade),
@@ -77,9 +80,9 @@ class TradingService:
 
     async def _process_signals(self):
         """Process trading signals for all users"""
-        signals = self.redis.get_all_keys("signals")
+        signals = await self.redis.get_all_keys("signals")
         for signal_key in signals:
-            signal_data = self.redis.get_hash("signals", signal_key.split(":")[-1])
+            signal_data = await self.redis.get_hash("signals", signal_key.split(":")[-1])
             if signal_data.get("processed") != "true":
                 # Process signal for each eligible user
                 await self._process_signal_for_users(signal_data)
@@ -96,7 +99,7 @@ class TradingService:
 
     async def _can_take_trade(self, user_id: str, signal_data: dict) -> bool:
         """Check if user can take this trade based on their configuration"""
-        user_data = self.redis.get_hash("users", user_id)
+        user_data = await self.redis.get_hash("users", user_id)
         max_capital = float(user_data["max_capital"])
         used_capital = float(user_data["used_capital"])
         max_risk = float(user_data["max_risk_per_trade"])
@@ -119,7 +122,7 @@ class TradingService:
             order_response = await self._create_order(broker, signal_data, config)
 
             # Update Redis with position information
-            self.redis.set_hash(f"positions:{user_id}", signal_data["identifier"], {
+            await self.redis.set_hash(f"positions:{user_id}", signal_data["identifier"], {
                 "entry_price": str(order_response["price"]),
                 "quantity": str(order_response["quantity"]),
                 "stop_loss": str(signal_data["stop_loss"]),
@@ -128,9 +131,9 @@ class TradingService:
             })
 
             # Update user's used capital
-            self.redis.increment_hash_field("users", user_id, "used_capital", 
+            await self.redis.increment_hash_field("users", user_id, "used_capital", 
                                          float(signal_data["required_capital"]))
-            self.redis.increment_hash_field("users", user_id, "active_positions", 1)
+            await self.redis.increment_hash_field("users", user_id, "active_positions", 1)
 
         except Exception as e:
             logger.error(f"Error executing trade for user {user_id}: {e}")
@@ -139,9 +142,9 @@ class TradingService:
         """Monitor positions for all users"""
         for user_id, user_info in self.users.items():
             try:
-                positions = self.redis.get_all_keys(f"positions:{user_id}")
+                positions = await self.redis.get_all_keys(f"positions:{user_id}")
                 for position_key in positions:
-                    position_data = self.redis.get_hash(f"positions:{user_id}", 
+                    position_data = await self.redis.get_hash(f"positions:{user_id}", 
                                                       position_key.split(":")[-1])
                     if position_data["status"] == "active":
                         await self._check_position_exit(user_id, user_info["broker"], 
