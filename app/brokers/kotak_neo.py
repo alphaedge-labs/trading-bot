@@ -115,3 +115,6 @@ class KotakNeo(BaseBroker):
             return modify_order.get("data", [])
         else:
             raise Exception(f"Failed to modify order: {modify_order}")
+
+    def form_order(self, data: Dict[str, Any], is_exit: bool):
+        return data

@@ -5,9 +5,9 @@ import logging
 from contextlib import asynccontextmanager
 from loguru import logger
 import asyncio
-
 from utils.datetime import get_ist_time
-from services.trading_service import TradingService
+from services.trading_service_v2 import TradingService
+from services.signal_processing_service import SignalProcessingService
 from database.redis import redis_client
 from config import PORT
 
@@ -77,8 +77,13 @@ async def main():
     await redis_client._connect()
 
     trading_service = TradingService()
+    signal_processing_service = SignalProcessingService()
+    
     app.state.trading_service = trading_service
+    app.state.signal_processing_service = signal_processing_service
+    
     trading_service_task = loop.create_task(trading_service.start())
+    signal_processing_task = loop.create_task(signal_processing_service.start())
 
     try:
         await asyncio.Event().wait()
@@ -90,6 +95,7 @@ async def main():
         # Disconnect from Redis
         await redis_client._disconnect()
         trading_service_task.cancel()
+        signal_processing_task.cancel()
         logger.info('Shutting down application')
 
 if __name__ == "__main__":
