@@ -6,9 +6,7 @@ from contextlib import asynccontextmanager
 from loguru import logger
 import asyncio
 from utils.datetime import get_ist_time
-from services.trading_service_v2 import TradingService
 from services.signal_processing_service import SignalProcessingService
-from database.redis import redis_client
 from config import PORT
 
 logger.remove()
@@ -64,6 +62,10 @@ async def main():
     loop = asyncio.get_running_loop()
 
     # create asyncio tasks
+    signal_processing_service = SignalProcessingService()    
+    app.state.signal_processing_service = signal_processing_service
+    signal_processing_task = loop.create_task(signal_processing_service.start())
+    
     config = uvicorn.Config(
         app=app,
         host="0.0.0.0",
@@ -73,18 +75,6 @@ async def main():
     server = uvicorn.Server(config)
     fastapi_task = loop.create_task(server.serve())
 
-    # Connect to Redis
-    await redis_client._connect()
-
-    trading_service = TradingService()
-    signal_processing_service = SignalProcessingService()
-    
-    app.state.trading_service = trading_service
-    app.state.signal_processing_service = signal_processing_service
-    
-    trading_service_task = loop.create_task(trading_service.start())
-    signal_processing_task = loop.create_task(signal_processing_service.start())
-
     try:
         await asyncio.Event().wait()
     except KeyboardInterrupt:
@@ -92,9 +82,6 @@ async def main():
     finally:
         # Cleanup resources
         fastapi_task.cancel()
-        # Disconnect from Redis
-        await redis_client._disconnect()
-        trading_service_task.cancel()
         signal_processing_task.cancel()
         logger.info('Shutting down application')
 

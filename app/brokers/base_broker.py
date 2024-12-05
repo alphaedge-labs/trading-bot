@@ -41,3 +41,8 @@ class BaseBroker(ABC):
     def form_order(self, data: Dict[str, Any], is_exit: bool):
         """Form an order"""
         pass
+
+    @abstractmethod
+    def place_order(self, order: Dict[str, Any]):
+        """Place an order"""
+        pass

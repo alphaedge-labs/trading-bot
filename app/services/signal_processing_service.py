@@ -6,144 +6,294 @@ from models.user import User
 import asyncio
 import json
 from datetime import datetime
+from services.trading_service import TradingService
+from constants.redis import HashSets
+from utils.id_generator import generate_id
+from constants.collections import Collections
 
 class SignalProcessingService:
     def __init__(self):
-        self.pubsub = redis_client.get_pubsub()
-        self.redis = redis_client
+        # Create a dedicated pubsub connection
+        self.redis_client = redis_client.get_new_connection()
         self.channels = ["signals"]
         self.running = False
-        self._processing_task = None
         self.users: Dict[str, User] = {}
+        self.trading_service = TradingService()
 
     async def start(self):
         logger.info("Starting signal processing service")
         if self.running:
             logger.warning("Signal processing service is already running")
             return
-        
+
+        # Load users
         await self._load_users()
-        self.running = True
+
+        logger.info("Starting to listen for signals and trading service")
+        # Run trading service start and listening for signals concurrently
+        await asyncio.gather(
+            self.trading_service.start(),
+            self.start_listening()
+        )
+        
 
     async def _load_users(self):
         users_collection = db['users']
         active_users = users_collection.find({"is_active": True}).to_list(length=None)
         self.users = {user["_id"]: user for user in active_users}
 
-        await self.start_listening()
+    async def _create_order_for_user(self, user: User, signal_data: dict) -> dict:
+        try:
+            # Calculate position size based on user's risk management settings
+            quantity = self._calculate_position_size(user, signal_data)
+            
+            # Get the first active broker for the user
+            broker = user["active_brokers"][0] if user["active_brokers"] else None
+            if not broker:
+                logger.error(f"No active broker found for user {user['_id']}")
+                return None
+
+            order = {
+                "user_id": user["_id"],
+                "broker": broker,
+                "symbol": signal_data["symbol"],
+                "strike_price": signal_data.get("strike_price"),
+                "expiry_date": signal_data.get("expiry_date"),
+                "right": signal_data.get("right", "CE"),
+                "quantity": quantity,
+                "entry_price": signal_data["entry_price"],
+                "stop_loss": signal_data["stop_loss"],
+                "target": signal_data["target_price"],
+                "order_type": "LIMIT",
+                "transaction_type": signal_data.get("transaction_type", "BUY"),
+                "product": "MIS",
+                "position_type": "LONG" if signal_data.get("transaction_type", "BUY") == "BUY" else "SHORT",
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            logger.info(f"Created order for user {user['_id']}: {order}")
+            return order
+            
+        except Exception as e:
+            logger.error(f"Error creating order: {e}")
+            return None
+
+    def _calculate_position_size(self, user: User, signal_data: dict) -> int:
+        try:
+            # Get user's risk management settings
+            risk_settings = user.get("risk_management", {})
+            capital = user.get("capital", {})
+            
+            # Calculate risk amount per trade
+            risk_per_trade = capital.get("available_balance", 0) * (risk_settings.get("risk_per_trade", 1) / 100)
+            risk_per_trade = 7500
+            # Calculate position size based on risk
+            entry_price = float(signal_data["entry_price"])
+            stop_loss = float(signal_data["stop_loss"])
+            risk_per_unit = abs(entry_price - stop_loss)
+            
+            # Calculate quantity
+            quantity = int(risk_per_trade / risk_per_unit)
+            
+            # Adjust for lot size if applicable
+            lot_size = int(signal_data.get("lot_size", 1))
+            quantity = (quantity // lot_size) * lot_size
+            
+            return max(quantity, lot_size)  # Return at least one lot
+            
+        except Exception as e:
+            logger.error(f"Error calculating position size: {e}")
+            return 0
 
     async def _process_signal(self, signal_key: str, signal_data: dict):
         eligible_orders = []
         for user_id, user in self.users.items():
-            if await self._is_user_eligible(user, signal_data):
+            if await self._is_user_eligible(user_id, user, signal_data):
                 order = await self._create_order_for_user(user, signal_data)
                 if order:
                     eligible_orders.append(order)
         
         if eligible_orders:
             await self._execute_orders(eligible_orders)
-            await self.redis.set_hash("signals", signal_key, {"processed": "true"})
 
-    async def _is_user_eligible(self, user: User, signal_data: dict) -> bool:
+    def _calculate_required_capital(self, signal_data: dict) -> float:
+        logger.info(f"Calculating required capital for signal: {signal_data}")
+        # TODO: Add more logic to calculate required capital, this is just for options, also this lot size is hard coded on data-server for nifty 50 options
+        return signal_data.get('entry_price', 0) * signal_data.get('lot_size')
+
+    async def _is_user_eligible(self, user_id: str, user: User, signal_data: dict) -> bool:
         # Get user's current positions and capital
-        user_positions = await self.redis.get_hash(f"positions:{user._id}", "*")
+        # logger.info(f"Processing signal for user: {user}")
+
+        identifier = self.redis_client._generate_key(signal_data)
+    
+        user_position_ids = await self.redis_client.get_hash(HashSets.POSITION_USER_MAPPINGS.value, user_id) or []
+        existing_position_ids = await self.redis_client.get_hash(HashSets.POSITION_ID_MAPPINGS.value, identifier) or []
+    
+        # Check if user has any position for this identifier
+        if set(existing_position_ids) & set(user_position_ids):
+            logger.info(f"User {user_id} already has a position for identifier {identifier}. It will be updated")
+            return False
         
+        # logger.info(f"User positions: {user_positions}")
+
         # Check if user has reached max positions
-        if len(user_positions) >= user.risk_management.max_open_positions:
+        if len(user_position_ids) >= user.get('risk_management', {}).get('max_open_positions', 0):
+            # logger.info(f"User {user_id} has reached max open positions")
             return False
 
         # Check if user has enough capital
         required_capital = self._calculate_required_capital(signal_data)
-        if required_capital > user.capital.available_balance:
+        # logger.info(f"Required capital: {required_capital}")
+        if required_capital > user.get('capital', {}).get('available_balance', 0):
+            # logger.info("User does not have enough capital")
             return False
 
         # Check if risk-reward ratio matches user's preferences
         signal_rr_ratio = (signal_data["target_price"] - signal_data["entry_price"]) / \
                          (signal_data["entry_price"] - signal_data["stop_loss"])
-        if signal_rr_ratio < user.risk_management.ideal_risk_reward_ratio:
+        
+        # logger.info(f"Signal RR ratio: {signal_rr_ratio}")
+        # logger.info(f"User ideal RR ratio: {user.get('risk_management', {}).get('ideal_risk_reward_ratio', 0)}")
+
+        if signal_rr_ratio < user.get('risk_management', {}).get('ideal_risk_reward_ratio', 0):
+            # logger.info("Signal RR ratio does not match user's preferences")
             return False
 
+        # logger.info("User is eligible")
         return True
+
+    async def _place_order(self, order: dict) -> dict:
+        try:
+            # Use the initialized trading service instance
+            broker_client = self.trading_service.get_broker_client(
+                order["user_id"], 
+                order["broker"]
+            )
+            
+            if not broker_client:
+                raise Exception("No broker client available")
+            
+            # Form and place the order
+            formatted_order = broker_client.form_order(order, is_exit=False)
+            order_result = await broker_client.place_order(formatted_order)
+            
+            if not order_result:
+                raise Exception("Order placement failed")
+            
+            return order_result
+            
+        except Exception as e:
+            logger.error(f"Error placing order: {e}")
+            return None
 
     async def _execute_orders(self, orders: List[Dict]):
         for order in orders:
+            # logger.info(f"Executing order: {order}")
             try:
                 # Place order with broker
                 order_result = await self._place_order(order)
-                
+                #logger.info(f"Order result: {order_result}")
+                if not order_result:
+                    logger.error(f"Failed to place order: {order}")
+                    continue
+
                 # Create position in Redis
-                position_id = f"position_{datetime.now().timestamp()}"
+                position_id = f"pos_{generate_id()}"
+                #logger.info(f"Generated position id: {position_id}")
+                identifier = self.redis_client._generate_key(order)
+                #logger.info(f"Generated identifier: {identifier}")
+                
                 position_data = {
                     "position_id": position_id,
-                    "account_id": order["user_id"],
-                    "symbol": order["symbol"],
-                    "strike_price": order["strike_price"],
-                    "expiry_date": order["expiry_date"],
-                    "identifier": f"{order['symbol']}:{order['expiry_date']}:{order['strike_price']}",
-                    "position_type": "LONG",
-                    "quantity": order["quantity"],
-                    "entry_price": order["entry_price"],
-                    "current_price": order["entry_price"],
-                    "unrealized_pnl": 0.0,
-                    "realized_pnl": 0.0,
-                    "stop_loss": order["stop_loss"],
-                    "take_profit": order["target"],
+                    "account_id": str(order["user_id"]),
+                    "symbol": str(order["symbol"]),
+                    "strike_price": str(order["strike_price"]),
+                    "expiry_date": str(order["expiry_date"]),
+                    "identifier": identifier,
+                    "broker": str(order["broker"]),
+                    "position_type": str(order.get("position_type", "LONG")),
+                    "quantity": str(order["quantity"]),
+                    "entry_price": str(order["entry_price"]),
+                    "current_price": str(order["entry_price"]),
+                    "unrealized_pnl": "0",
+                    "realized_pnl": "0",
+                    "stop_loss": str(order["stop_loss"]),
+                    "take_profit": str(order["target"]),
                     "timestamp": datetime.now().isoformat(),
                     "status": "OPEN",
-                    "should_exit": False,
+                    "should_exit": "False",
                     "last_updated": datetime.now().strftime("%c")
                 }
+                #logger.info(f"Generated position data: {position_data}")
                 
-                await self.redis.set_hash("positions", position_id, position_data)
-                
-                # Update position mapping
-                identifier = f"{order['symbol']}:{order['expiry_date']}:{order['right']}:{order['strike_price']}"
-                await self._update_position_mapping(identifier, position_id)
+                # Set position data, update position mapping and user mapping concurrently
+                await asyncio.gather(
+                    self.redis_client.set_hash(HashSets.POSITIONS.value, position_id, position_data),
+                    self._update_position_mapping(identifier, position_id),
+                    self._update_position_user_mapping(order["user_id"], position_id)
+                )
+                #logger.info(f"Saved position data, position mapping and user mapping")
                 
                 # Save order to MongoDB
-                await db["orders"].insert_one({
+                db[Collections.ORDERS.value].insert_one({
                     **order,
                     **order_result,
                     "position_id": position_id,
                     "created_at": datetime.now()
                 })
+                #logger.info(f"Saved order to MongoDB: {order_result}")
                 
             except Exception as e:
                 logger.error(f"Error executing order: {e}")
 
     async def _update_position_mapping(self, identifier: str, position_id: str):
-        mapping = await self.redis.get_hash("position_mappings", identifier) or {}
-        position_ids = set(mapping.get("position_ids", "").split(","))
-        position_ids.add(position_id)
-        await self.redis.set_hash("position_mappings", identifier, {
-            "position_ids": ",".join(position_ids)
-        })
+        """Update position mapping in Redis"""
+        #logger.info(f"Updating position mapping for identifier: {identifier} and position_id: {position_id}")
+        mapping = await self.redis_client.get_hash(HashSets.POSITION_ID_MAPPINGS.value, identifier) or []
+        #logger.info(f"Current mapping: {mapping}")
+        mapping_set = set(mapping)
+        mapping_set.add(position_id)
+        mapping = list(mapping_set)
+        #logger.info(f"Updated mapping: {mapping}")
+        await self.redis_client.set_hash(HashSets.POSITION_ID_MAPPINGS.value, identifier, mapping)
+
+    async def _update_position_user_mapping(self, user_id: str, position_id: str):
+        """Update position user mapping in Redis"""
+        #logger.info(f"Updating position user mapping for user_id: {user_id} and position_id: {position_id}")
+        mapping = await self.redis_client.get_hash(HashSets.POSITION_USER_MAPPINGS.value, user_id) or []
+        #logger.info(f"Current mapping: {mapping}")
+        mapping_set = set(mapping)
+        mapping_set.add(position_id)
+        mapping = list(mapping_set)
+        #logger.info(f"Updated mapping: {mapping}")
+        await self.redis_client.set_hash(HashSets.POSITION_USER_MAPPINGS.value, user_id, mapping)
 
     async def start_listening(self):
         """Start listening to Redis channels"""
-        await self.pubsub.subscribe(*self.channels)
+        self.running = True
+        await self.redis_client.pubsub.subscribe(*self.channels)
         logger.info(f"Started listening to channels: {self.channels}")
-        
+
         while self.running:
             try:
-                message = await self.pubsub.get_message()
+                message = await self.redis_client.pubsub.get_message()
+
                 if message and message['type'] == 'message':
                     channel = message['channel'].decode('utf-8')
-                    decoded_data = json.loads(message['data'].decode('utf-8'))
-                    
+                    data = json.loads(message['data'])
+
                     if channel == 'signals':
-                        signal_data = decoded_data.get('data', {})
-                        signal_key = signal_data.get('id') or f"signal_{datetime.now().timestamp()}"
-                        
+                        signal_data = data.get('data')
+                        signal_key = signal_data.get('identifier')
+                        #logger.info(f"Received signal: {signal_data}")
                         # Store signal in Redis for persistence
-                        await self.redis.set_hash("signals", signal_key, signal_data)
+                        # await self.redis_client.set_hash("signals", signal_key, signal_data)
                         
                         # Process the signal if it hasn't been processed yet
-                        if not signal_data.get("processed"):
-                            await self._process_signal(signal_key, signal_data)
-                            logger.info(f"Processed signal: {signal_key}")
+                        await self._process_signal(signal_key, signal_data)
                     
-                    logger.debug(f"Received event from channel '{channel}': {decoded_data}")
+                    logger.debug(f"Received event from channel '{channel}': {signal_data}")
             except json.JSONDecodeError as e:
                 logger.error(f"Error decoding message: {str(e)}")
                 continue
@@ -157,5 +307,5 @@ class SignalProcessingService:
     async def stop_listening(self):
         """Stop listening to Redis channels"""
         self.running = False
-        await self.pubsub.unsubscribe()
+        await self.redis_client.pubsub.unsubscribe(*self.channels)
         logger.info("Stopped listening to Redis channels") 
