@@ -1,13 +1,13 @@
 from time import sleep
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
-from app.config import (
+from config import (
     MONGO_URI,
     MONGO_DB
 )
-from loguru import logger
+from utils.logging import logger
 
-mongo_logger = logger.bind(name="MongoDB")
+mongo_logger = logger.bind(name="mongodb")
 
 class MongoDBClient:
     def __init__(self, db_name, max_retries=20):

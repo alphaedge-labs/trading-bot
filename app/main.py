@@ -1,12 +1,17 @@
 import sys
-import uvicorn
-from fastapi import FastAPI
+import asyncio
 import logging
-from contextlib import asynccontextmanager
-from loguru import logger
 
-from app.utils.datetime import get_ist_time
-from app.services.trading_service import TradingService
+import uvicorn
+from loguru import logger
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from utils.datetime import get_ist_time
+
+from services.signal_processing_service import SignalProcessingService
+from services.trading_service import TradingService
+
+from config import PORT
 
 logger.remove()
 logger.add(
@@ -48,15 +53,7 @@ logging.getLogger("uvicorn.access").handlers = [InterceptHandler()]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize trading service
-    trading_service = TradingService()
-    # Start trading service
-    await trading_service.start()
-    # Store trading service in app state
-    app.state.trading_service = trading_service
     yield
-    # Cleanup: Stop trading service
-    await trading_service.stop()
 
 app = FastAPI(lifespan=lifespan, debug=True)
 
@@ -64,6 +61,33 @@ app = FastAPI(lifespan=lifespan, debug=True)
 def health_check():
     return {"status": "running", "message": "AlphaEdge Trading Bot is running", "datetime": get_ist_time()}
 
+async def main():
+    global loop
+    loop = asyncio.get_running_loop()
+
+    # create asyncio tasks
+    signal_processing_service = SignalProcessingService()    
+    app.state.signal_processing_service = signal_processing_service
+    signal_processing_task = loop.create_task(signal_processing_service.start())
+    
+    config = uvicorn.Config(
+        app=app,
+        host="0.0.0.0",
+        port=PORT,
+        loop="asyncio"
+    )
+    server = uvicorn.Server(config)
+    fastapi_task = loop.create_task(server.serve())
+
+    try:
+        await asyncio.Event().wait()
+    except KeyboardInterrupt:
+        logger.info('Shutting down application')
+    finally:
+        # Cleanup resources
+        fastapi_task.cancel()
+        signal_processing_task.cancel()
+        logger.info('Shutting down application')
+
 if __name__ == "__main__":
-    from app.config import PORT
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    asyncio.run(main())
