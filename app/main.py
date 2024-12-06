@@ -1,12 +1,16 @@
 import sys
-import uvicorn
-from fastapi import FastAPI
-import logging
-from contextlib import asynccontextmanager
-from loguru import logger
 import asyncio
+import logging
+
+import uvicorn
+from loguru import logger
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
 from utils.datetime import get_ist_time
+
 from services.signal_processing_service import SignalProcessingService
+from services.trading_service import TradingService
+
 from config import PORT
 
 logger.remove()

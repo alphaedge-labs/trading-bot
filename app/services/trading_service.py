@@ -1,16 +1,19 @@
 import json
 import asyncio
 from loguru import logger
-from database.redis import redis_client
-from database.mongodb import db
 from datetime import datetime
 
+from database.mongodb import db
+from database.redis import redis_client
+
+from constants.collections import Collections
 from constants.brokers import Broker
 from constants.redis import HashSets
 from constants.positions import PositionStatus
 from brokers.kotak_neo import KotakNeo
 from brokers.paper_broker import PaperBroker
-from constants.collections import Collections
+from utils.id_generator import generate_id
+
 class TradingService:
     def __init__(self):
         # Create a dedicated pubsub connection
@@ -18,6 +21,8 @@ class TradingService:
         self.channels = ["positions"]
         self.running = False
         self.broker_clients = {}
+        self.positions_collection = db[Collections.CLOSED_POSITIONS.value]
+        self.users_collection = db[Collections.USERS.value]
 
     async def start(self):
         """Get all active users from MongoDB"""
@@ -65,10 +70,10 @@ class TradingService:
             position_data = await self.redis_client.get_hash(HashSets.POSITIONS.value, position_id)
 
             if not position_data:
-                logger.error(f"Position {position_id} not found")
+                logger.error(f"Position {position_id} not found to manage")
                 return
             
-            logger.info(f"cp: {position_data['current_price']}, tp: {position_data['take_profit']}, sl: {position_data['stop_loss']}")
+            logger.info(f"user_id: {user_id}, position_id: {position_id}, pnl: {position_data['unrealized_pnl']}")
 
             if position_data.get("should_exit") == True:
                 # Get the appropriate broker client
@@ -84,37 +89,42 @@ class TradingService:
                     
                     # Calculate realized P&L
                     entry_price = float(position_data["entry_price"])
-                    exit_price = float(order_result["current_price"])
+                    exit_price = float(order_result["average_price"])
                     quantity = float(position_data["quantity"])
                     realized_pnl = (exit_price - entry_price) * quantity
                     
                     # Store closed position in MongoDB
                     closed_position = {
                         **position_data,
+                        "_id": f"clpos_{generate_id()}",
                         "exit_price": exit_price,
                         "exit_time": datetime.now().isoformat(),
                         "realized_pnl": realized_pnl,
                         "order_result": order_result,
                         "status": "CLOSED"
                     }
+
+                    self.positions_collection.insert_one(closed_position)
+                    self._update_user_metrics(user_id, realized_pnl, position_data)
+
+                    identifier = self.redis_client._generate_key(position_data)
+                    await asyncio.gather(
+                        # Remove from positions hash
+                        self.redis_client.delete_hash(HashSets.POSITIONS.value, position_id),
+                        # Clean up position ID mapping
+                        self._cleanup_mapping(HashSets.POSITION_ID_MAPPINGS, identifier, position_id),
+                        # Clean up user ID mapping
+                        self._cleanup_mapping(HashSets.POSITION_USER_MAPPINGS, position_data["user_id"], position_id)
+                    )
                     
-                    await db[Collections.CLOSED_POSITIONS.value].insert_one(closed_position)
-                    
-                    # Update user's capital and metrics
-                    user = self.users[user_id]
-                    await self._update_user_metrics(user_id, realized_pnl, position_data)
-                    
-                    # Remove position from Redis
-                    await self._cleanup_position(position_id, position_data)
-                    
-                    # logger.info(f"Successfully closed position {position_id} for user {user_id}")
+                    logger.info(f"Closed position {position_id} for user {user_id} with P&L: {realized_pnl}")
                     
                 except Exception as e:
                     logger.error(f"Error executing exit order for position {position_id}: {e}")
                     # Mark position as failed_exit
                     position = await self.redis_client.get_hash(HashSets.POSITIONS.value, position_id)
                     if not position:
-                        logger.error(f"Position {position_id} not found")
+                        logger.error(f"Position {position_id} not found to exit")
                         return
                     
                     # Extend the position object with additional fields
@@ -128,11 +138,11 @@ class TradingService:
         except Exception as e:
             logger.error(f"Error managing position {position_id}: {e}")
 
-    async def _update_user_metrics(self, user_id: str, realized_pnl: float, position_data: dict):
+    def _update_user_metrics(self, user_id: str, realized_pnl: float, position_data: dict):
         """Update user's capital and trading metrics"""
         try:
             # Update user document in MongoDB
-            await db["users"].update_one(
+            self.users_collection.update_one(
                 {"_id": user_id},
                 {
                     "$inc": {
@@ -154,43 +164,20 @@ class TradingService:
         except Exception as e:
             logger.error(f"Error updating user metrics for {user_id}: {e}")
 
-    # TODO: this function is handling cleaning both position_ids and position_user_ids, can split this into two functions for better readability and handling
-    async def _cleanup_position(self, position_id: str, position_data: dict):
-        """Clean up position data from Redis"""
+    async def _cleanup_mapping(self, hash_set: HashSets, key: str, position_id: str):
+        """Helper method to clean up Redis hash mappings"""
         try:
-            # Remove from positions hash
-            await self.redis_client.delete_hash(HashSets.POSITIONS.value, position_id)
-            
-            # Remove from position mapping
-            identifier = await self.redis_client._generate_key(position_data)
+            mapping = await self.redis_client.get_hash(hash_set.value, key) or []
+            mapping_set = set(mapping)
+            mapping_set.discard(position_id)
+            mapping_list = list(mapping_set)
 
-            position_ids_mapping = await self.redis_client.get_hash(HashSets.POSITION_ID_MAPPINGS.value, identifier) or []
-            position_ids_set = set(position_ids_mapping)
-            position_ids_set.discard(position_id)
-            position_ids = list(position_ids_set)
-            
-            if position_ids:
-                await self.redis_client.set_hash(HashSets.POSITION_ID_MAPPINGS.value, identifier, {
-                    "position_ids": ",".join(position_ids)
-                })
+            if mapping_list:
+                await self.redis_client.set_hash(hash_set.value, key, mapping_list)
             else:
-                await self.redis_client.delete_hash(HashSets.POSITION_ID_MAPPINGS.value, identifier)
-
-
-            position_user_ids_mapping = await self.redis_client.get_hash(HashSets.POSITION_USER_MAPPINGS.value, position_data["user_id"]) or []
-            position_user_ids_set = set(position_user_ids_mapping)
-            position_user_ids_set.discard(position_id)
-            position_user_ids = list(position_user_ids_set)
-
-            if position_user_ids:
-                await self.redis_client.set_hash(HashSets.POSITION_USER_MAPPINGS.value, position_data["user_id"], {
-                    "position_user_ids": ",".join(position_user_ids)
-                })
-            else:
-                await self.redis_client.delete_hash(HashSets.POSITION_USER_MAPPINGS.value, position_data["user_id"])
-
+                await self.redis_client.delete_hash(hash_set.value, key)
         except Exception as e:
-            logger.error(f"Error cleaning up position {position_id}: {e}")
+            logger.error(f"Error cleaning up mapping for {hash_set.value}/{key}: {e}")
 
     async def manage_risk(self, data):
         """Manage risk for a user"""
@@ -294,3 +281,37 @@ class TradingService:
         self.running = False
         await self.redis_client.pubsub.unsubscribe(*self.channels)
         logger.info("Stopped listening to Redis channels") 
+
+    async def exit_all_positions_for_user(self, user_id: str):
+        """Exit all open positions for a specific user"""
+        try:
+            # Get all positions for user
+            position_ids = await self.redis_client.get_hash(
+                HashSets.POSITION_USER_MAPPINGS.value, 
+                user_id
+            ) or []
+            
+            for position_id in position_ids:
+                position_data = await self.redis_client.get_hash(
+                    HashSets.POSITIONS.value, 
+                    position_id
+                )
+                if position_data:
+                    position_data["should_exit"] = True
+                    await self.redis_client.set_hash(
+                        HashSets.POSITIONS.value,
+                        position_id,
+                        position_data
+                    )
+                    
+                    # Process the exit
+                    await self.manage_positions({
+                        "user_id": user_id,
+                        "position_id": position_id
+                    })
+                    
+            logger.info(f"Exited all positions for user {user_id}")
+            
+        except Exception as e:
+            logger.error(f"Error exiting positions for user {user_id}: {e}")
+        

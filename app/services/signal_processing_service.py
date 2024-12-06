@@ -1,15 +1,17 @@
+import json
+import asyncio
 from typing import Dict, List
 from loguru import logger
+from datetime import datetime
+
+from models.user import User
 from database.redis import redis_client
 from database.mongodb import db
-from models.user import User
-import asyncio
-import json
-from datetime import datetime
 from services.trading_service import TradingService
 from constants.redis import HashSets
-from utils.id_generator import generate_id
 from constants.collections import Collections
+from utils.id_generator import generate_id
+from utils.datetime import is_within_trading_hours
 
 class SignalProcessingService:
     def __init__(self):
@@ -30,12 +32,12 @@ class SignalProcessingService:
         await self._load_users()
 
         logger.info("Starting to listen for signals and trading service")
-        # Run trading service start and listening for signals concurrently
+        # Run trading service start, listening for signals, and trading hours check concurrently
         await asyncio.gather(
             self.trading_service.start(),
-            self.start_listening()
+            self.start_listening(),
+            self._check_trading_hours()
         )
-        
 
     async def _load_users(self):
         users_collection = db['users']
@@ -71,7 +73,7 @@ class SignalProcessingService:
                 "timestamp": datetime.now().isoformat()
             }
             
-            logger.info(f"Created order for user {user['_id']}: {order}")
+            # logger.info(f"Created order for user {user['_id']}: {order}")
             return order
             
         except Exception as e:
@@ -122,6 +124,15 @@ class SignalProcessingService:
         return signal_data.get('entry_price', 0) * signal_data.get('lot_size')
 
     async def _is_user_eligible(self, user_id: str, user: User, signal_data: dict) -> bool:
+        # Check trading hours first
+        trading_hours = user.get("settings", {}).get("preferred_trading_hours", {})
+        start_time = trading_hours.get("start")
+        end_time = trading_hours.get("end")
+        
+        if start_time and end_time and not is_within_trading_hours(start_time, end_time):
+            logger.info(f"Outside trading hours for user {user_id}")
+            return False
+            
         # Get user's current positions and capital
         # logger.info(f"Processing signal for user: {user}")
 
@@ -132,7 +143,7 @@ class SignalProcessingService:
     
         # Check if user has any position for this identifier
         if set(existing_position_ids) & set(user_position_ids):
-            logger.info(f"User {user_id} already has a position for identifier {identifier}. It will be updated")
+            # logger.info(f"User {user_id} already has a position for identifier {identifier}. It will be updated")
             return False
         
         # logger.info(f"User positions: {user_positions}")
@@ -206,8 +217,9 @@ class SignalProcessingService:
                 
                 position_data = {
                     "position_id": position_id,
-                    "account_id": str(order["user_id"]),
+                    "user_id": str(order["user_id"]),
                     "symbol": str(order["symbol"]),
+                    "right": str(order["right"]),
                     "strike_price": str(order["strike_price"]),
                     "expiry_date": str(order["expiry_date"]),
                     "identifier": identifier,
@@ -309,3 +321,32 @@ class SignalProcessingService:
         self.running = False
         await self.redis_client.pubsub.unsubscribe(*self.channels)
         logger.info("Stopped listening to Redis channels") 
+
+    async def _check_trading_hours(self):
+        """Check trading hours for all users and manage positions accordingly"""
+        while self.running:
+            try:
+                for user_id, user in self.users.items():
+                    trading_hours = user.get("settings", {}).get("preferred_trading_hours", {})
+                    start_time = trading_hours.get("start")
+                    end_time = trading_hours.get("end")
+                    
+                    if not start_time or not end_time:
+                        continue
+                    
+                    is_trading_time = is_within_trading_hours(start_time, end_time)
+                    user_positions = await self.redis_client.get_hash(
+                        HashSets.POSITION_USER_MAPPINGS.value, 
+                        user_id
+                    ) or []
+                    
+                    # If outside trading hours and has positions, exit all positions
+                    if not is_trading_time and user_positions:
+                        logger.info(f"Outside trading hours for user {user_id}, closing all positions")
+                        await self.trading_service.exit_all_positions_for_user(user_id)
+                    
+                await asyncio.sleep(60)  # Check every minute
+                
+            except Exception as e:
+                logger.error(f"Error checking trading hours: {e}")
+                await asyncio.sleep(60) 

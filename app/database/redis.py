@@ -78,12 +78,8 @@ class RedisClient:
         return json.loads(data) if data else None
 
     # Delete a hash
-    async def delete_hash(self, category, identifier):
-        key = self._generate_key(category, identifier)
-        # Get the data before deleting
-        data = await self.get_hash(category, identifier)
-        await self.client.delete(key)
-        logger.info(f"Deleted hash for key: {key}")
+    async def delete_hash(self, category, key):
+        await self.client.hdel(category, key)
 
     # Get all keys in a category
     async def get_all_keys(self, category):

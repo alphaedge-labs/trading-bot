@@ -1,8 +1,9 @@
-from brokers.base_broker import BaseBroker
 from typing import Dict, Any
-from utils.logging import logger
 from datetime import datetime
+
+from brokers.base_broker import BaseBroker
 from constants.brokers import Broker
+from utils.logging import logger
 from utils.id_generator import generate_id
 
 class PaperBroker(BaseBroker):
@@ -72,7 +73,7 @@ class PaperBroker(BaseBroker):
                 "symbol": order["symbol"]
             }
             
-            logger.info(f"Paper trade order placed successfully: {order_result}")
+            # logger.info(f"Paper trade order placed successfully: {order_result}")
             return order_result
             
         except Exception as e:
