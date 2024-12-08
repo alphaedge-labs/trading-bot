@@ -1,166 +1,320 @@
+import json
 import asyncio
 from loguru import logger
-from typing import Optional, Dict
-from app.database.redis import redis_client
-from app.database.mongodb import db
-from app.brokers.kotak_neo import KotakNeo
-from app.models.user import User
+from datetime import datetime
+
+from database.mongodb import db
+from database.redis import redis_client
+
+from constants.collections import Collections
+from constants.brokers import Broker
+from constants.redis import HashSets
+from constants.positions import PositionStatus
+from brokers.kotak_neo import KotakNeo
+from brokers.paper_broker import PaperBroker
+from utils.id_generator import generate_id
+from utils.datetime import _parse_datetime
 
 class TradingService:
     def __init__(self):
-        self.redis = redis_client
+        # Create a dedicated pubsub connection
+        self.redis_client = redis_client.get_new_connection()
+        self.channels = ["positions"]
         self.running = False
-        self._trading_task: Optional[asyncio.Task] = None
-        self.users: Dict[str, Dict] = {}  # Store user configs and broker instances
-        
-    async def start(self):
-        """Start the trading service"""
-        if self.running:
-            logger.warning("Trading service is already running")
-            return
-            
-        # Load all users from MongoDB
-        await self._load_users()
-        
-        self.running = True
-        self._trading_task = asyncio.create_task(self._trading_loop())
-        logger.info("Trading service started")
+        self.broker_clients = {}
+        self.positions_collection = db[Collections.CLOSED_POSITIONS.value]
+        self.users_collection = db[Collections.USERS.value]
 
-    async def _load_users(self):
-        """Load all active users from MongoDB and initialize their data in Redis"""
+    async def start(self):
+        """Get all active users from MongoDB"""
+        users_collection = db['users']
+        active_users = users_collection.find({"is_active": True}).to_list(length=None)
+        self.users = {user["_id"]: user for user in active_users}
+
+        # Initialize broker clients for each user's active brokers
+        for user_id, user in self.users.items():
+            self.broker_clients[user_id] = {}
+            
+            # Only initialize clients for active brokers
+            for broker_config in user["trading"]:
+                if broker_config["TRADING_BROKER"] in user["active_brokers"]:
+                    if broker_config["TRADING_BROKER"] == Broker.PAPER_BROKER.value:
+                        self.broker_clients[user_id][Broker.PAPER_BROKER.value] = PaperBroker(
+                            client_id=user["_id"],
+                            client_secret=user["email"]
+                        )
+        
+        logger.info(f"Initialized broker clients for {len(self.broker_clients)} users")
+
+        self.running = True
+        await self.start_listening()
+        
+    def get_broker_client(self, user_id: str, broker_name: str):
+        """Helper method to get specific broker client for a user"""
+        if user_id not in self.broker_clients:
+            logger.error(f"No broker clients found for user {user_id}")
+            return None
+        
+        if broker_name not in self.broker_clients[user_id]:
+            logger.error(f"Broker {broker_name} not found for user {user_id}")
+            return None
+            
+        return self.broker_clients[user_id][broker_name]
+
+    async def manage_positions(self, data):
+        """Manage positions for a user"""
+        user_id = data.get("user_id")
+        position_id = data.get("position_id")
+        
         try:
-            users_collection = db['users']
-            async for user_data in users_collection.find({"trading_config.is_active": True}):
-                user = User(**user_data)
-                
-                # Initialize broker instance for user
-                if user.broker_name == "kotak_neo":
-                    broker = KotakNeo(
-                        client_id=user.broker_credentials["client_id"],
-                        client_secret=user.broker_credentials["client_secret"]
+            # Get position data
+            position_data = await self.redis_client.get_hash(HashSets.POSITIONS.value, position_id)
+
+            if not position_data:
+                logger.error(f"Position {position_id} not found to manage")
+                return
+            
+            logger.info(f"user_id: {user_id}, position_id: {position_id}, pnl: {position_data['unrealized_pnl']}")
+
+            if position_data.get("should_exit") == True:
+                # Get the appropriate broker client
+                broker_client = self.get_broker_client(user_id, position_data["broker"])
+                if not broker_client:
+                    return
+                    
+                # Place exit order
+                exit_order = broker_client.form_order(position_data, True)
+                try:
+                    # Place the exit order
+                    order_result = await broker_client.place_order(exit_order)
+                    
+                    # Calculate realized P&L
+                    entry_price = float(position_data["entry_price"])
+                    exit_price = float(order_result["average_price"])
+                    quantity = float(position_data["quantity"])
+                    realized_pnl = (exit_price - entry_price) * quantity
+                    
+                    # Store closed position in MongoDB
+                    closed_position = {
+                        **position_data,
+                        "_id": f"clpos_{generate_id()}",
+                        "exit_price": exit_price,
+                        "exit_time": datetime.now(),
+                        "timestamp": _parse_datetime(position_data["timestamp"]),
+                        "last_updated": _parse_datetime(position_data["last_updated"]),
+                        "realized_pnl": realized_pnl,
+                        "order_result": order_result,
+                        "status": "CLOSED"
+                    }
+
+                    self.positions_collection.insert_one(closed_position)
+                    self._update_user_metrics(user_id, realized_pnl, position_data)
+
+                    identifier = self.redis_client._generate_key(position_data)
+                    await asyncio.gather(
+                        # Remove from positions hash
+                        self.redis_client.delete_hash(HashSets.POSITIONS.value, position_id),
+                        # Clean up position ID mapping
+                        self._cleanup_mapping(HashSets.POSITION_ID_MAPPINGS, identifier, position_id),
+                        # Clean up user ID mapping
+                        self._cleanup_mapping(HashSets.POSITION_USER_MAPPINGS, position_data["user_id"], position_id)
                     )
-                    # Add more broker types as needed
-                
-                # Store user config and broker instance
-                self.users[user.user_id] = {
-                    "config": user.trading_config,
-                    "broker": broker
+                    
+                    logger.info(f"Closed position {position_id} for user {user_id} with P&L: {realized_pnl}")
+                    
+                except Exception as e:
+                    logger.error(f"Error executing exit order for position {position_id}: {e}")
+                    # Mark position as failed_exit
+                    position = await self.redis_client.get_hash(HashSets.POSITIONS.value, position_id)
+                    if not position:
+                        logger.error(f"Position {position_id} not found to exit")
+                        return
+                    
+                    # Extend the position object with additional fields
+                    position["status"] = PositionStatus.EXIT_FAILED.value
+                    position["error"] = str(e)
+
+                    # Save the updated position back to Redis using set_hash
+                    await self.redis_client.set_hash(HashSets.POSITIONS.value, position_id, position)
+
+                    
+        except Exception as e:
+            logger.error(f"Error managing position {position_id}: {e}")
+
+    def _update_user_metrics(self, user_id: str, realized_pnl: float, position_data: dict):
+        """Update user's capital and trading metrics"""
+        try:
+            # Update user document in MongoDB
+            self.users_collection.update_one(
+                {"_id": user_id},
+                {
+                    "$inc": {
+                        "capital.available_balance": realized_pnl,
+                        "capital.total_deployed": -abs(float(position_data.get("quantity", 0)))
+                    },
+                    "$push": {
+                        "activity_logs": {
+                            "timestamp": datetime.now(),
+                            "activity": f"Position closed with P&L: {realized_pnl}"
+                        }
+                    }
                 }
+            )
+            
+            # Update user's data in memory
+            self.users[user_id]["capital"]["available_balance"] += realized_pnl
+            
+        except Exception as e:
+            logger.error(f"Error updating user metrics for {user_id}: {e}")
+
+    async def _cleanup_mapping(self, hash_set: HashSets, key: str, position_id: str):
+        """Helper method to clean up Redis hash mappings"""
+        try:
+            mapping = await self.redis_client.get_hash(hash_set.value, key) or []
+            mapping_set = set(mapping)
+            mapping_set.discard(position_id)
+            mapping_list = list(mapping_set)
+
+            if mapping_list:
+                await self.redis_client.set_hash(hash_set.value, key, mapping_list)
+            else:
+                await self.redis_client.delete_hash(hash_set.value, key)
+        except Exception as e:
+            logger.error(f"Error cleaning up mapping for {hash_set.value}/{key}: {e}")
+
+    async def manage_risk(self, data):
+        """Manage risk for a user"""
+        try:
+            user_id = data.get("user_id")
+            user = self.users.get(user_id)
+            
+            if not user:
+                logger.error(f"User {user_id} not found")
+                return
+            
+            # Get all open positions for user
+            positions_keys = await self.redis_client.get_hash(HashSets.POSITION_USER_MAPPINGS.value, user_id) or []
+            total_risk = 0
+            
+            for position_key in positions_keys:
+                position = await self.redis_client.get_hash(HashSets.POSITIONS.value, position_key)
+                if not position:
+                    continue
+                unrealized_pnl = float(position.get("unrealized_pnl", 0))
+                total_risk += abs(unrealized_pnl)
                 
-                # Initialize user data in Redis
-                self.redis.set_hash("users", user.user_id, {
-                    "max_capital": str(user.trading_config.max_capital),
-                    "used_capital": "0",
-                    "max_risk_per_trade": str(user.trading_config.max_risk_per_trade),
-                    "risk_reward_ratio": str(user.trading_config.risk_reward_ratio),
-                    "active_positions": "0"
-                })
-                
-                logger.info(f"Loaded user {user.user_id} into trading service")
+            # Check if total risk exceeds user's risk limits
+            max_risk = user.get("risk_management", {}).get("max_risk_per_day", float('inf'))
+            
+            if total_risk > max_risk:
+                logger.warning(f"Risk limit exceeded for user {user_id}. Closing all positions.")
+                await self.exit_all_positions()
                 
         except Exception as e:
-            logger.error(f"Error loading users: {e}")
-            raise
+            logger.error(f"Error managing risk: {e}")
 
-    async def _trading_loop(self):
-        """Main trading loop"""
+    async def start_listening(self):
+        """Start listening to Redis channels"""
+        self.running = True
+        await self.redis_client.pubsub.subscribe(*self.channels)
+        logger.info(f"Started listening to channels: {self.channels}")
+        
         while self.running:
             try:
-                # Process signals for all users
-                await self._process_signals()
-                # Monitor positions for all users
-                await self._monitor_all_positions()
+                message = await self.redis_client.pubsub.get_message()
+                if message and message['type'] == 'message':
+                    channel = message['channel'].decode('utf-8')
+                    decoded_data = json.loads(message['data'].decode('utf-8'))
+                    
+                    if channel == "positions":
+                        await self.manage_positions(decoded_data["data"])
+                        
+            except Exception as e:
+                logger.error(f"Error processing message: {str(e)}")
                 await asyncio.sleep(1)
-            except Exception as e:
-                logger.error(f"Error in trading loop: {e}")
-                await asyncio.sleep(5)
+                continue
+                
+            await asyncio.sleep(0.1)
 
-    async def _process_signals(self):
-        """Process trading signals for all users"""
-        signals = self.redis.get_all_keys("signals")
-        for signal_key in signals:
-            signal_data = self.redis.get_hash("signals", signal_key.split(":")[-1])
-            if signal_data.get("processed") != "true":
-                # Process signal for each eligible user
-                await self._process_signal_for_users(signal_data)
-
-    async def _process_signal_for_users(self, signal_data: dict):
-        """Process a signal for all eligible users"""
-        for user_id, user_info in self.users.items():
-            try:
-                # Check if user can take this trade
-                if await self._can_take_trade(user_id, signal_data):
-                    await self._execute_trade(user_id, user_info, signal_data)
-            except Exception as e:
-                logger.error(f"Error processing signal for user {user_id}: {e}")
-
-    async def _can_take_trade(self, user_id: str, signal_data: dict) -> bool:
-        """Check if user can take this trade based on their configuration"""
-        user_data = self.redis.get_hash("users", user_id)
-        max_capital = float(user_data["max_capital"])
-        used_capital = float(user_data["used_capital"])
-        max_risk = float(user_data["max_risk_per_trade"])
-
-        # Add your trade validation logic here
-        # Example:
-        if used_capital + float(signal_data["required_capital"]) > max_capital:
-            return False
-        if float(signal_data["risk_amount"]) > max_risk:
-            return False
-        return True
-
-    async def _execute_trade(self, user_id: str, user_info: dict, signal_data: dict):
-        """Execute trade for a specific user"""
+    async def exit_all_positions(self):
+        """Exit all open positions for a user"""
         try:
-            broker = user_info["broker"]
-            config = user_info["config"]
+            # Get all open positions for user
+            positions = await self.redis_client.get_all_keys(HashSets.POSITIONS.value)
+            # logger.info(f"Found {len(positions)} positions to close")
 
-            # Create order based on signal
-            order_response = await self._create_order(broker, signal_data, config)
+            for position in positions:
+                try:
+                    # Create exit order
+                    exit_order = {
+                        "user_id": position["user_id"],
+                        "broker": position["broker"],
+                        "symbol": position["symbol"],
+                        "strike_price": position.get("strike_price"),
+                        "expiry_date": position.get("expiry_date"),
+                        "right": position.get("right"),
+                        "quantity": position["quantity"],
+                        "order_type": "MARKET",
+                        "transaction_type": "SELL" if position["position_type"] == "LONG" else "BUY",
+                        "product": position["product"],
+                        "timestamp": datetime.now().isoformat()
+                    }
 
-            # Update Redis with position information
-            self.redis.set_hash(f"positions:{user_id}", signal_data["identifier"], {
-                "entry_price": str(order_response["price"]),
-                "quantity": str(order_response["quantity"]),
-                "stop_loss": str(signal_data["stop_loss"]),
-                "target": str(signal_data["target"]),
-                "status": "active"
-            })
+                    # Process exit order through manage_positions
+                    await self.manage_positions({
+                        "action": "EXIT",
+                        "position_id": position["position_id"],
+                        "order": exit_order
+                    })
+                    
+                    # logger.info(f"Initiated exit for position {position['position_id']}")
+                    
+                except Exception as e:
+                    logger.error(f"Error exiting position {position['position_id']}: {e}")
+                    continue
 
-            # Update user's used capital
-            self.redis.increment_hash_field("users", user_id, "used_capital", 
-                                         float(signal_data["required_capital"]))
-            self.redis.increment_hash_field("users", user_id, "active_positions", 1)
-
-        except Exception as e:
-            logger.error(f"Error executing trade for user {user_id}: {e}")
-
-    async def _monitor_all_positions(self):
-        """Monitor positions for all users"""
-        for user_id, user_info in self.users.items():
-            try:
-                positions = self.redis.get_all_keys(f"positions:{user_id}")
-                for position_key in positions:
-                    position_data = self.redis.get_hash(f"positions:{user_id}", 
-                                                      position_key.split(":")[-1])
-                    if position_data["status"] == "active":
-                        await self._check_position_exit(user_id, user_info["broker"], 
-                                                      position_data)
-            except Exception as e:
-                logger.error(f"Error monitoring positions for user {user_id}: {e}")
-
-    async def _check_position_exit(self, user_id: str, broker: KotakNeo, position: dict):
-        """Check if position needs to be exited for a specific user"""
-        try:
-            # Implement your position exit logic here
-            # Example: Check if stop loss or target is hit
-            current_price = await self._get_current_price(broker, position["symbol"])
+            logger.info(f"Successfully closed all positions for users")
             
-            if (float(current_price) <= float(position["stop_loss"]) or 
-                float(current_price) >= float(position["target"])):
-                
-                # Exit position
-                await self._exit_position(user_id, broker, position)
-                
         except Exception as e:
-            logger.error(f"Error checking position exit for user {user_id}: {e}") 
+            logger.error(f"Error in exit_all_positions: {e}")
+            raise
+        
+    async def stop_listening(self):
+        """Stop listening to Redis channels"""
+        self.running = False
+        await self.redis_client.pubsub.unsubscribe(*self.channels)
+        logger.info("Stopped listening to Redis channels") 
+
+    async def exit_all_positions_for_user(self, user_id: str):
+        """Exit all open positions for a specific user"""
+        try:
+            # Get all positions for user
+            position_ids = await self.redis_client.get_hash(
+                HashSets.POSITION_USER_MAPPINGS.value, 
+                user_id
+            ) or []
+            
+            for position_id in position_ids:
+                position_data = await self.redis_client.get_hash(
+                    HashSets.POSITIONS.value, 
+                    position_id
+                )
+                if position_data:
+                    position_data["should_exit"] = True
+                    await self.redis_client.set_hash(
+                        HashSets.POSITIONS.value,
+                        position_id,
+                        position_data
+                    )
+                    
+                    # Process the exit
+                    await self.manage_positions({
+                        "user_id": user_id,
+                        "position_id": position_id
+                    })
+                    
+            logger.info(f"Exited all positions for user {user_id}")
+            
+        except Exception as e:
+            logger.error(f"Error exiting positions for user {user_id}: {e}")
+        
