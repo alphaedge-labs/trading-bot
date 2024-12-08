@@ -13,6 +13,7 @@ from constants.positions import PositionStatus
 from brokers.kotak_neo import KotakNeo
 from brokers.paper_broker import PaperBroker
 from utils.id_generator import generate_id
+from utils.datetime import _parse_datetime
 
 class TradingService:
     def __init__(self):
@@ -98,7 +99,9 @@ class TradingService:
                         **position_data,
                         "_id": f"clpos_{generate_id()}",
                         "exit_price": exit_price,
-                        "exit_time": datetime.now().isoformat(),
+                        "exit_time": datetime.now(),
+                        "timestamp": _parse_datetime(position_data["timestamp"]),
+                        "last_updated": _parse_datetime(position_data["last_updated"]),
                         "realized_pnl": realized_pnl,
                         "order_result": order_result,
                         "status": "CLOSED"
