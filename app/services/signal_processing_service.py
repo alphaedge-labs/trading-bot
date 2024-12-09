@@ -86,23 +86,37 @@ class SignalProcessingService:
             risk_settings = user.get("risk_management", {})
             capital = user.get("capital", {})
             
-            # Calculate risk amount per trade
-            risk_per_trade = capital.get("available_balance", 0) * (risk_settings.get("risk_per_trade", 1) / 100)
-            risk_per_trade = 7500
-            # Calculate position size based on risk
+            # Extract required values
+            available_balance = capital.get("available_balance", 0)
+            risk_per_trade_percent = risk_settings.get("risk_per_trade", 1)  # Default 1%
+            stop_loss_buffer = risk_settings.get("stop_loss_buffer", 0.5)  # Default buffer
+            # TODO: Add this later, refer docs/position_sizing_methods.md
+            # position_sizing_method = risk_settings.get("position_sizing_method", "fixed")
+            
+            
+            # Risk amount per trade
+            risk_per_trade = available_balance * (risk_per_trade_percent / 100)
+            
+            # Entry and stop-loss prices
             entry_price = float(signal_data["entry_price"])
             stop_loss = float(signal_data["stop_loss"])
-            risk_per_unit = abs(entry_price - stop_loss)
             
-            # Calculate quantity
-            quantity = int(risk_per_trade / risk_per_unit)
+            # Adjusted stop loss considering buffer
+            adjusted_stop_loss = stop_loss * (1 - stop_loss_buffer / 100)
+            risk_per_unit = abs(entry_price - adjusted_stop_loss)
             
-            # Adjust for lot size if applicable
+            # Calculate position size
+            if risk_per_unit == 0:
+                raise ValueError("Stop loss and entry price are too close, cannot calculate risk per unit.")
+        
+            quantity = risk_per_trade / risk_per_unit
+        
+            # Ensure position size respects the lot size
             lot_size = int(signal_data.get("lot_size", 1))
-            quantity = (quantity // lot_size) * lot_size
+            quantity = max(1, int(quantity // lot_size) * lot_size)
             
-            return max(quantity, lot_size)  # Return at least one lot
-            
+            return quantity
+
         except Exception as e:
             logger.error(f"Error calculating position size: {e}")
             return 0
