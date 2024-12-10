@@ -9,12 +9,13 @@ from constants.collections import Collections
 class UserService:
     def __init__(self):
         self.redis_client = redis_client.get_new_connection()
-        self.users_collection = db[Collections.USERS.value]
         self.users: Dict[str, dict] = {}
         
     async def initialize(self):
         """Load all active users into memory and Redis"""
         try:
+            from database.mongodb import db
+            self.users_collection = db[Collections.USERS.value]
             active_users = await self.users_collection.find({"is_active": True}).to_list(length=None)
             for user in active_users:
                 user_id = user["_id"]

@@ -14,7 +14,12 @@ class AsyncMongoDBClient:
         self.db_name = db_name
         self.max_retries = max_retries
         self.client = AsyncIOMotorClient(MONGO_URI)
-        asyncio.create_task(self._connect())
+        self._is_connected = False
+
+    async def ensure_connected(self):
+        if not self._is_connected:
+            await self._connect()
+            self._is_connected = True
 
     async def _connect(self):
         retries = 0
@@ -29,8 +34,17 @@ class AsyncMongoDBClient:
                 await asyncio.sleep(retries * 0.5)
         raise Exception("Too many retries.")
 
-    def get_database(self):
+    async def get_database(self):
+        await self.ensure_connected()
         return self.client[self.db_name]
 
+# Create the client instance
 mongo_client = AsyncMongoDBClient(db_name=MONGO_DB)
-db = mongo_client.get_database()
+
+# Initialize database connection asynchronously
+async def init_db():
+    global db
+    db = await mongo_client.get_database()
+
+# Initializing db needs to be done in an async context
+db = None

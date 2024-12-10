@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from utils.datetime import get_ist_time
 
+from database.mongodb import init_db
 from services.signal_processing_service import SignalProcessingService
 from services.trading_service import TradingService
 from services.user_service import UserService
@@ -62,47 +63,88 @@ def health_check():
     return {"status": "running", "message": "AlphaEdge Trading Bot is running", "datetime": get_ist_time()}
 
 async def main():
-    global loop
-    loop = asyncio.get_running_loop()
-
-    user_service = UserService()
-    await user_service.initialize()
-
-    trading_service = TradingService(user_service=user_service)
-
-    # create asyncio tasks
-    signal_processing_service = SignalProcessingService(
-        user_service=user_service, 
-        trading_service=trading_service
-    )    
-
-    # add services to app state
-    app.state.user_service = user_service
-    app.state.trading_service = trading_service
-    app.state.signal_processing_service = signal_processing_service
-
-    signal_processing_task = loop.create_task(signal_processing_service.start())
-    trading_service_task = loop.create_task(trading_service.start())
-
-    config = uvicorn.Config(
-        app=app,
-        host="0.0.0.0",
-        port=PORT,
-        loop="asyncio"
-    )
-    server = uvicorn.Server(config)
-    fastapi_task = loop.create_task(server.serve())
-
+    # Store all services that need cleanup
+    services = {}
+    
     try:
+        await init_db()
+
+        global loop
+        loop = asyncio.get_running_loop()
+
+        # Initialize services
+        user_service = UserService()
+        await user_service.initialize()
+        services['user_service'] = user_service
+
+        trading_service = TradingService(user_service=user_service)
+        await trading_service.start()
+        services['trading_service'] = trading_service
+
+        signal_processing_service = SignalProcessingService(
+            user_service=user_service, 
+            trading_service=trading_service
+        )
+        await signal_processing_service.start()
+        services['signal_processing_service'] = signal_processing_service
+
+        # add services to app state
+        app.state.user_service = user_service
+        app.state.trading_service = trading_service
+        app.state.signal_processing_service = signal_processing_service
+
+        config = uvicorn.Config(
+            app=app,
+            host="0.0.0.0",
+            port=PORT,
+            loop="asyncio"
+        )
+        server = uvicorn.Server(config)
+        fastapi_task = loop.create_task(server.serve())
+
+        # Wait indefinitely until interrupted
         await asyncio.Event().wait()
+        
     except KeyboardInterrupt:
-        logger.info('Shutting down application')
+        logger.info("Received keyboard interrupt, initiating shutdown...")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        raise
     finally:
-        # Cleanup resources
-        fastapi_task.cancel()
-        signal_processing_task.cancel()
-        trading_service_task.cancel()
-        logger.info('Shutting down application')
+        logger.info("Shutting down services...")
+        
+        # Cleanup FastAPI
+        if 'fastapi_task' in locals():
+            fastapi_task.cancel()
+            try:
+                await fastapi_task
+            except asyncio.CancelledError:
+                pass
+
+        # Cleanup Redis connections and services
+        if 'signal_processing_service' in services:
+            logger.info("Stopping signal processing service...")
+            await services['signal_processing_service'].stop_listening()
+            
+        if 'trading_service' in services:
+            logger.info("Stopping trading service...")
+            await services['trading_service'].stop_listening()
+
+        # Close Redis connections
+        if 'redis_client' in services:
+            logger.info("Closing Redis connections...")
+            await services['redis_client']._disconnect()
+
+        # Close MongoDB connection (if needed)
+        # Add any other cleanup needed
+
+        logger.info("Shutdown complete")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt in main thread")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        raise

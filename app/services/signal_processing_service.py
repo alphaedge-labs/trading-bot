@@ -27,18 +27,59 @@ class SignalProcessingService:
         self.trading_service = trading_service
 
     async def start(self):
-        logger.info("Starting signal processing service")
+        """Start the signal processing service"""
         if self.running:
             logger.warning("Signal processing service is already running")
             return
 
-        logger.info("Starting to listen for signals and trading service")
-        # Run trading service start, listening for signals, and trading hours check concurrently
-        await asyncio.gather(
-            self.trading_service.start(),
-            self.start_listening(),
-            self._check_trading_hours()
-        )
+        # Ensure Redis connection is established
+        try:
+            # Initialize Redis connection
+            await self.redis_client._connect()
+            await asyncio.gather(
+                self.trading_service.start_listening(),
+                self.start_listening(),
+                self._check_trading_hours()
+            )
+        except Exception as e:
+            logger.error(f"Error starting signal processing service: {e}")
+            raise
+
+    async def start_listening(self):
+        """Start listening to Redis channels"""
+        self.running = True
+        self.pubsub = self.redis_client.pubsub
+        await self.pubsub.subscribe(*self.channels)
+        logger.info(f"Started listening to channels: {self.channels}")
+
+        while self.running:
+            try:
+                message = await self.pubsub.get_message()
+
+                if message and message['type'] == 'message':
+                    channel = message['channel'].decode('utf-8')
+                    data = json.loads(message['data'])
+
+                    if channel == 'signals':
+                        signal_data = data.get('data')
+                        signal_key = signal_data.get('identifier')
+                        #logger.info(f"Received signal: {signal_data}")
+                        # Store signal in Redis for persistence
+                        # await self.redis_client.set_hash("signals", signal_key, signal_data)
+                        
+                        # Process the signal if it hasn't been processed yet
+                        await self._process_signal(signal_key, signal_data)
+                    
+                    logger.debug(f"Received event from channel '{channel}': {signal_data}")
+            except json.JSONDecodeError as e:
+                logger.error(f"Error decoding message: {str(e)}")
+                continue
+            except Exception as e:
+                logger.error(f"Error processing message: {str(e)}")
+                await asyncio.sleep(1)
+                continue
+
+        # await asyncio.sleep(0.1) # Preventing CPU overload, for pussies
 
     async def _create_order_for_user(self, user: User, signal_data: dict) -> dict:
         try:
@@ -369,46 +410,20 @@ class SignalProcessingService:
         #logger.info(f"Updated mapping: {mapping}")
         await self.redis_client.set_hash(HashSets.POSITION_USER_MAPPINGS.value, user_id, mapping)
 
-    async def start_listening(self):
-        """Start listening to Redis channels"""
-        self.running = True
-        await self.redis_client.pubsub.subscribe(*self.channels)
-        logger.info(f"Started listening to channels: {self.channels}")
-
-        while self.running:
-            try:
-                message = await self.redis_client.pubsub.get_message()
-
-                if message and message['type'] == 'message':
-                    channel = message['channel'].decode('utf-8')
-                    data = json.loads(message['data'])
-
-                    if channel == 'signals':
-                        signal_data = data.get('data')
-                        signal_key = signal_data.get('identifier')
-                        #logger.info(f"Received signal: {signal_data}")
-                        # Store signal in Redis for persistence
-                        # await self.redis_client.set_hash("signals", signal_key, signal_data)
-                        
-                        # Process the signal if it hasn't been processed yet
-                        await self._process_signal(signal_key, signal_data)
-                    
-                    logger.debug(f"Received event from channel '{channel}': {signal_data}")
-            except json.JSONDecodeError as e:
-                logger.error(f"Error decoding message: {str(e)}")
-                continue
-            except Exception as e:
-                logger.error(f"Error processing message: {str(e)}")
-                await asyncio.sleep(1)
-                continue
-
-        # await asyncio.sleep(0.1) # Preventing CPU overload, for pussies
-
     async def stop_listening(self):
-        """Stop listening to Redis channels"""
-        self.running = False
-        await self.redis_client.pubsub.unsubscribe(*self.channels)
-        logger.info("Stopped listening to Redis channels") 
+        """Gracefully stop the service"""
+        try:
+            self.running = False
+            if hasattr(self, 'pubsub') and self.pubsub:
+                await self.pubsub.unsubscribe(*self.channels)
+                await self.pubsub.close()
+            
+            if self.redis_client and self.redis_client.client:
+                await self.redis_client._disconnect()
+                
+            logger.info("Signal processing service stopped")
+        except Exception as e:
+            logger.error(f"Error stopping signal processing service: {e}")
 
     async def _check_trading_hours(self):
         """Check trading hours for all users and manage positions accordingly"""

@@ -27,8 +27,6 @@ class TradingService:
         self.channels = ["positions"]
         self.running = False
         self.broker_clients = {}
-        self.positions_collection = db[Collections.CLOSED_POSITIONS.value]
-        self.users_collection = db[Collections.USERS.value]
 
     async def start(self):
         """Get all active users and initialize broker clients"""
@@ -48,10 +46,12 @@ class TradingService:
                         )
         
         logger.info(f"Initialized broker clients for {len(self.broker_clients)} users")
-
         self.running = True
-        await self.start_listening()
-        
+
+        from database.mongodb import db
+        self.positions_collection = db[Collections.CLOSED_POSITIONS.value]
+        self.users_collection = db[Collections.USERS.value]
+
     def get_broker_client(self, user_id: str, broker_name: str):
         """Helper method to get specific broker client for a user"""
         if user_id not in self.broker_clients:
@@ -201,12 +201,13 @@ class TradingService:
     async def start_listening(self):
         """Start listening to Redis channels"""
         self.running = True
-        await self.redis_client.pubsub.subscribe(*self.channels)
+        self.pubsub = self.redis_client.pubsub
+        await self.pubsub.subscribe(*self.channels)
         logger.info(f"Started listening to channels: {self.channels}")
         
         while self.running:
             try:
-                message = await self.redis_client.pubsub.get_message()
+                message = await self.pubsub.get_message()
                 if message and message['type'] == 'message':
                     channel = message['channel'].decode('utf-8')
                     decoded_data = json.loads(message['data'].decode('utf-8'))
@@ -265,10 +266,33 @@ class TradingService:
             raise
         
     async def stop_listening(self):
-        """Stop listening to Redis channels"""
-        self.running = False
-        await self.redis_client.pubsub.unsubscribe(*self.channels)
-        logger.info("Stopped listening to Redis channels") 
+        """Gracefully stop the service"""
+
+        logger.info("Stopping trading service...")
+        all_user_ids = await self.redis_client.get_all_keys(HashSets.POSITION_USER_MAPPINGS.value)
+        for user_id in all_user_ids:
+            logger.info(f"Exiting all positions for user {user_id}")
+            await self.exit_all_positions_for_user(user_id)
+
+        # Wait for all positions to close
+        positions = await self.redis_client.get_all_keys(HashSets.POSITIONS.value)
+        while len(positions) > 0:
+            logger.info(f"Waiting for {len(positions)} positions to close...")
+            await asyncio.sleep(5)
+            positions = await self.redis_client.get_all_keys(HashSets.POSITIONS.value)
+
+        try:
+            self.running = False
+            if hasattr(self, 'pubsub') and self.pubsub:
+                await self.pubsub.unsubscribe(*self.channels)
+                await self.pubsub.close()
+            
+            if self.redis_client and self.redis_client.client:
+                await self.redis_client._disconnect()
+                
+            logger.info("Trading service stopped")
+        except Exception as e:
+            logger.error(f"Error stopping trading service: {e}")
 
     async def exit_all_positions_for_user(self, user_id: str):
         """Exit all open positions for a specific user"""
