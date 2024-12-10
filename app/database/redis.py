@@ -8,6 +8,9 @@ from config import (
     REDIS_DB
 )
 from utils.logging import logger
+from datetime import datetime
+from bson import ObjectId
+
 redis_logger = logger.bind(name="redis")
 
 redis_host = REDIS_HOST
@@ -64,12 +67,20 @@ class RedisClient:
         #TODO: fix this to fit equity stocks too, rn this is only for options
         return f'{data["symbol"]}:{data["expiry_date"]}:{data["right"]}:{data["strike_price"]}'
 
+    def _serialize_for_json(self, obj):
+        """Helper method to serialize objects that json.dumps can't handle by default"""
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if isinstance(obj, ObjectId):
+            return str(obj)
+        raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
     # Set or update a hash
     async def set_hash(self, category, key, data):
         if not key:
             key = self._generate_key(data)
         if isinstance(data, dict) or isinstance(data, list):
-            data = json.dumps(data)
+            data = json.dumps(data, default=self._serialize_for_json)
         await self.client.hset(category, key, data)
 
     # Get a hash
@@ -110,8 +121,14 @@ class RedisClient:
     
     async def _disconnect(self):
         """Disconnect from Redis"""
-        await self.client.close()
-        logger.info("Disconnected from Redis")
+        try:
+            if self.pubsub:
+                await self.pubsub.close()
+            if self.client:
+                await self.client.close()
+            redis_logger.info("Disconnected from Redis")
+        except Exception as e:
+            redis_logger.error(f"Error disconnecting from Redis: {e}")
 
     def get_new_connection(self):
         """Create and return a new RedisClient instance"""

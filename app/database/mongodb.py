@@ -1,5 +1,5 @@
-from time import sleep
-from pymongo import MongoClient
+import asyncio
+from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import ConnectionFailure
 from config import (
     MONGO_URI,
@@ -9,28 +9,42 @@ from utils.logging import logger
 
 mongo_logger = logger.bind(name="mongodb")
 
-class MongoDBClient:
+class AsyncMongoDBClient:
     def __init__(self, db_name, max_retries=20):
         self.db_name = db_name
         self.max_retries = max_retries
-        self.client = MongoClient(MONGO_URI)
-        self._connect()
+        self.client = AsyncIOMotorClient(MONGO_URI)
+        self._is_connected = False
 
-    def _connect(self):
+    async def ensure_connected(self):
+        if not self._is_connected:
+            await self._connect()
+            self._is_connected = True
+
+    async def _connect(self):
         retries = 0
         while retries < self.max_retries:
             try:
-                self.client.admin.command('ping')
+                await self.client.admin.command('ping')
                 mongo_logger.info("Connected to MongoDB!!!")
                 return
             except ConnectionFailure:
                 retries += 1
                 mongo_logger.info(f"Attempt {retries} to reconnect...")
-                sleep(retries * 0.5)
+                await asyncio.sleep(retries * 0.5)
         raise Exception("Too many retries.")
 
-    def get_database(self):
+    async def get_database(self):
+        await self.ensure_connected()
         return self.client[self.db_name]
 
-mongo_client = MongoDBClient(db_name=MONGO_DB)
-db = mongo_client.get_database()
+# Create the client instance
+mongo_client = AsyncMongoDBClient(db_name=MONGO_DB)
+
+# Initialize database connection asynchronously
+async def init_db():
+    global db
+    db = await mongo_client.get_database()
+
+# Initializing db needs to be done in an async context
+db = None
