@@ -6,18 +6,23 @@ from datetime import datetime
 from database.mongodb import db
 from database.redis import redis_client
 
+from services.user_service import UserService
+
 from constants.collections import Collections
 from constants.brokers import Broker
 from constants.redis import HashSets
 from constants.positions import PositionStatus
+
 from brokers.kotak_neo import KotakNeo
 from brokers.paper_broker import PaperBroker
+
 from utils.id_generator import generate_id
 from utils.datetime import _parse_datetime
 
 class TradingService:
-    def __init__(self):
+    def __init__(self, user_service: UserService):
         # Create a dedicated pubsub connection
+        self.user_service = user_service
         self.redis_client = redis_client.get_new_connection()
         self.channels = ["positions"]
         self.running = False
@@ -26,13 +31,11 @@ class TradingService:
         self.users_collection = db[Collections.USERS.value]
 
     async def start(self):
-        """Get all active users from MongoDB"""
-        users_collection = db['users']
-        active_users = users_collection.find({"is_active": True}).to_list(length=None)
-        self.users = {user["_id"]: user for user in active_users}
+        """Get all active users and initialize broker clients"""
+        active_users = await self.user_service.get_active_users()
 
         # Initialize broker clients for each user's active brokers
-        for user_id, user in self.users.items():
+        for user_id, user in active_users.items():
             self.broker_clients[user_id] = {}
             
             # Only initialize clients for active brokers
@@ -88,12 +91,15 @@ class TradingService:
                     # Place the exit order
                     order_result = await broker_client.place_order(exit_order)
                     
+                    # Release blocked capital
+                    blocked_capital = float(position_data.get("blocked_capital", 0))
+
                     # Calculate realized P&L
                     entry_price = float(position_data["entry_price"])
                     exit_price = float(order_result["average_price"])
                     quantity = float(position_data["quantity"])
                     realized_pnl = (exit_price - entry_price) * quantity
-                    
+
                     # Store closed position in MongoDB
                     closed_position = {
                         **position_data,
@@ -107,17 +113,22 @@ class TradingService:
                         "status": "CLOSED"
                     }
 
-                    self.positions_collection.insert_one(closed_position)
-                    self._update_user_metrics(user_id, realized_pnl, position_data)
+                    await self.positions_collection.insert_one(closed_position)
+                    # Release blocked capital and update capital with realized PnL
+                    await self.user_service.release_capital(
+                        user_id=position_data["user_id"], 
+                        blocked_capital=blocked_capital,
+                        pnl=realized_pnl
+                    )
 
                     identifier = self.redis_client._generate_key(position_data)
                     await asyncio.gather(
                         # Remove from positions hash
                         self.redis_client.delete_hash(HashSets.POSITIONS.value, position_id),
                         # Clean up position ID mapping
-                        self._cleanup_mapping(HashSets.POSITION_ID_MAPPINGS, identifier, position_id),
-                        # Clean up user ID mapping
-                        self._cleanup_mapping(HashSets.POSITION_USER_MAPPINGS, position_data["user_id"], position_id)
+                        self._cleanup_mapping(HashSets.POSITION_ID_MAPPINGS.value, identifier, position_id),
+                        # Clean up position user mapping
+                        self._cleanup_mapping(HashSets.POSITION_USER_MAPPINGS.value, position_data["user_id"], position_id)
                     )
                     
                     logger.info(f"Closed position {position_id} for user {user_id} with P&L: {realized_pnl}")
@@ -141,32 +152,6 @@ class TradingService:
         except Exception as e:
             logger.error(f"Error managing position {position_id}: {e}")
 
-    def _update_user_metrics(self, user_id: str, realized_pnl: float, position_data: dict):
-        """Update user's capital and trading metrics"""
-        try:
-            # Update user document in MongoDB
-            self.users_collection.update_one(
-                {"_id": user_id},
-                {
-                    "$inc": {
-                        "capital.available_balance": realized_pnl,
-                        "capital.total_deployed": -abs(float(position_data.get("quantity", 0)))
-                    },
-                    "$push": {
-                        "activity_logs": {
-                            "timestamp": datetime.now(),
-                            "activity": f"Position closed with P&L: {realized_pnl}"
-                        }
-                    }
-                }
-            )
-            
-            # Update user's data in memory
-            self.users[user_id]["capital"]["available_balance"] += realized_pnl
-            
-        except Exception as e:
-            logger.error(f"Error updating user metrics for {user_id}: {e}")
-
     async def _cleanup_mapping(self, hash_set: HashSets, key: str, position_id: str):
         """Helper method to clean up Redis hash mappings"""
         try:
@@ -186,7 +171,7 @@ class TradingService:
         """Manage risk for a user"""
         try:
             user_id = data.get("user_id")
-            user = self.users.get(user_id)
+            user = await self.user_service.get_user(user_id)
             
             if not user:
                 logger.error(f"User {user_id} not found")

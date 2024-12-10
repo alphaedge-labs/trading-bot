@@ -10,6 +10,7 @@ from utils.datetime import get_ist_time
 
 from services.signal_processing_service import SignalProcessingService
 from services.trading_service import TradingService
+from services.user_service import UserService
 
 from config import PORT
 
@@ -50,7 +51,6 @@ class InterceptHandler(logging.Handler):
 logging.getLogger("uvicorn").handlers = [InterceptHandler()]
 logging.getLogger("uvicorn.access").handlers = [InterceptHandler()]
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
@@ -65,11 +65,25 @@ async def main():
     global loop
     loop = asyncio.get_running_loop()
 
+    user_service = UserService()
+    await user_service.initialize()
+
+    trading_service = TradingService(user_service=user_service)
+
     # create asyncio tasks
-    signal_processing_service = SignalProcessingService()    
+    signal_processing_service = SignalProcessingService(
+        user_service=user_service, 
+        trading_service=trading_service
+    )    
+
+    # add services to app state
+    app.state.user_service = user_service
+    app.state.trading_service = trading_service
     app.state.signal_processing_service = signal_processing_service
+
     signal_processing_task = loop.create_task(signal_processing_service.start())
-    
+    trading_service_task = loop.create_task(trading_service.start())
+
     config = uvicorn.Config(
         app=app,
         host="0.0.0.0",
@@ -87,6 +101,7 @@ async def main():
         # Cleanup resources
         fastapi_task.cancel()
         signal_processing_task.cancel()
+        trading_service_task.cancel()
         logger.info('Shutting down application')
 
 if __name__ == "__main__":
