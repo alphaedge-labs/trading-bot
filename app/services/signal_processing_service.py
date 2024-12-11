@@ -254,9 +254,9 @@ class SignalProcessingService:
         # Get user's current positions and capital
         # logger.info(f"Processing signal for user: {user}")
 
-        # if not self._fits_user_risk_management(user, signal_data):
-        #     # logger.info(f"User {user_id} does not fit risk management")
-        #     return False
+        if not self._fits_user_risk_management(user, signal_data):
+            # logger.info(f"User {user_id} does not fit risk management")
+            return False
 
         identifier = self.redis_client._generate_key(signal_data)
     
@@ -335,7 +335,10 @@ class SignalProcessingService:
                 capital_to_block = order["quantity"] * order["entry_price"]
                 
                 # Block capital
-                await self.user_service.block_capital(order["user_id"], capital_to_block)
+                await self.user_service.block_capital(
+                    user_id=order["user_id"], 
+                    amount=capital_to_block
+                )
                 
                 # Create position in Redis
                 position_id = f"pos_{generate_id()}"
