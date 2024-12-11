@@ -116,8 +116,8 @@ class TradingService:
                     await self.positions_collection.insert_one(closed_position)
                     # Release blocked capital and update capital with realized PnL
                     await self.user_service.release_capital(
-                        user_id=position_data["user_id"], 
-                        blocked_capital=blocked_capital,
+                        user_id=position_data["user_id"],
+                        amount=blocked_capital,
                         pnl=realized_pnl
                     )
 
