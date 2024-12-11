@@ -124,11 +124,11 @@ class TradingService:
                     identifier = self.redis_client._generate_key(position_data)
                     await asyncio.gather(
                         # Remove from positions hash
-                        self.redis_client.delete_hash(HashSets.POSITIONS.value, position_id),
+                        self.redis_client.delete_hash(HashSets.POSITIONS, position_id),
                         # Clean up position ID mapping
-                        self._cleanup_mapping(HashSets.POSITION_ID_MAPPINGS.value, identifier, position_id),
+                        self._cleanup_mapping(HashSets.POSITION_ID_MAPPINGS, identifier, position_id),
                         # Clean up position user mapping
-                        self._cleanup_mapping(HashSets.POSITION_USER_MAPPINGS.value, position_data["user_id"], position_id)
+                        self._cleanup_mapping(HashSets.POSITION_USER_MAPPINGS, position_data["user_id"], position_id)
                     )
                     
                     logger.info(f"Closed position {position_id} for user {user_id} with P&L: {realized_pnl}")
