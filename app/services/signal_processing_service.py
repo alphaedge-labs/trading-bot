@@ -17,6 +17,8 @@ from constants.collections import Collections
 from utils.id_generator import generate_id
 from utils.datetime import is_within_trading_hours
 
+MAX_POSITION_SIZE = 1000
+
 class SignalProcessingService:
     def __init__(self, user_service: UserService, trading_service: TradingService):
         self.user_service = user_service
@@ -171,6 +173,8 @@ class SignalProcessingService:
             if quantity < lot_size:
                 logger.warning("Calculated position size is less than one lot. Skipping trade.")
                 return 0  # Skip trade
+
+            quantity = min(quantity, MAX_POSITION_SIZE)
 
             return quantity
 
