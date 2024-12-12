@@ -17,7 +17,7 @@ from constants.collections import Collections
 from utils.id_generator import generate_id
 from utils.datetime import is_within_trading_hours
 
-MAX_POSITION_SIZE = 1000
+MAX_POSITION_SIZE = 900
 
 class SignalProcessingService:
     def __init__(self, user_service: UserService, trading_service: TradingService):
