@@ -3,7 +3,7 @@ from neo_api_client import NeoAPI
 from typing import Dict, Any, Optional
 
 class KotakNeo(BaseBroker):
-    def __init__(self, client_id: str, client_secret: str, environment: str = 'uat'):
+    def __init__(self, client_id: str, client_secret: str, environment: str = 'prod'):
         self.client_id = client_id
         self.client_secret = client_secret
         self.client = NeoAPI(consumer_key=client_id, consumer_secret=client_secret, environment=environment)

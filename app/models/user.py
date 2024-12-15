@@ -27,6 +27,7 @@ class RiskManagement(BaseModel):
 class Capital(BaseModel):
     total_deployed: float
     available_balance: float
+    available_balance_per_position: float
 
 class TradingHours(BaseModel):
     start: str

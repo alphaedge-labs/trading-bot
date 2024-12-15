@@ -44,7 +44,13 @@ class TradingService:
                             client_id=user["_id"],
                             client_secret=user["email"]
                         )
-        
+                        
+                    elif broker_config["TRADING_BROKER"] == Broker.KOTAK_NEO.value:
+                        self.broker_clients[user_id][Broker.KOTAK_NEO.value] = KotakNeo(
+                            client_id=user["_id"],
+                            client_secret=user["email"]
+                        )
+
         logger.info(f"Initialized broker clients for {len(self.broker_clients)} users")
         self.running = True
 
