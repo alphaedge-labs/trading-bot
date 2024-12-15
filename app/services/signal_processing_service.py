@@ -140,6 +140,11 @@ class SignalProcessingService:
             if available_balance is None or available_balance <= 0:
                 raise ValueError("Invalid or insufficient available balance.")
 
+
+            available_capital_per_position = capital.get("available_balance_per_position")
+            if available_capital_per_position is None or available_capital_per_position <= 0:
+                raise ValueError("Invalid or insufficient available capital per position.")
+
             risk_per_trade_percent = risk_settings.get("ideal_risk_reward_ratio", 2.5)
             stop_loss_buffer = risk_settings.get("stop_loss_buffer", 0.5)
             lot_size = int(signal_data.get("lot_size", 1))
@@ -157,7 +162,7 @@ class SignalProcessingService:
             stop_loss = float(stop_loss)
 
             # Calculate risk per trade and adjusted stop-loss
-            risk_per_trade = available_balance * (risk_per_trade_percent / 100)
+            risk_per_trade = available_capital_per_position * (risk_per_trade_percent / 100)
             adjusted_stop_loss = stop_loss * (1 - stop_loss_buffer / 100)
             risk_per_unit = abs(entry_price - adjusted_stop_loss)
 
