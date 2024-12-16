@@ -87,9 +87,14 @@ class SignalProcessingService:
         try:
             # Calculate position size based on user's risk management settings
             quantity = self._calculate_position_size(user, signal_data)
-            
+
+            if quantity == 0:
+                logger.warning("Calculated position size is 0. Skipping trade.")
+                return None
+
             # Get the first active broker for the user
             broker = user["active_brokers"][0] if user["active_brokers"] else None
+
             if not broker:
                 logger.error(f"No active broker found for user {user['_id']}")
                 return None
@@ -182,7 +187,6 @@ class SignalProcessingService:
             quantity = min(quantity, MAX_POSITION_SIZE)
 
             return quantity
-
 
         except ValueError as e:
             logger.warning(f"Position size calculation issue: {e}")
@@ -376,7 +380,8 @@ class SignalProcessingService:
                     "status": "OPEN",
                     "should_exit": False,
                     "blocked_capital": capital_to_block,
-                    "last_updated": datetime.now().strftime("%c")
+                    "last_updated": datetime.now().strftime("%c"),
+                    "created_at": datetime.now().strftime("%c")
                 }
                 #logger.info(f"Generated position data: {position_data}")
                 
