@@ -9,6 +9,10 @@ COPY . .
 
 ENV PYTHONPATH=/app/src
 
+# Set container timezone to IST
+ENV TZ=Asia/Kolkata
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
 RUN pip install "git+https://github.com/Kotak-Neo/kotak-neo-api.git#egg=neo_api_client"
 
 RUN pip install --no-deps -r requirements.txt
