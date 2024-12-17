@@ -145,8 +145,12 @@ class SignalProcessingService:
             if available_balance is None or available_balance <= 0:
                 raise ValueError("Invalid or insufficient available balance.")
 
+            open_positions_count = risk_settings.get("open_positions", 0)
+            if open_positions_count >= risk_settings.get("max_open_positions", 0):
+                raise ValueError("User has reached the maximum number of open positions.")
 
-            available_capital_per_position = capital.get("available_balance_per_position")
+            available_capital_per_position = available_balance / (risk_settings.get("max_open_positions", 0) - open_positions_count)
+            
             if available_capital_per_position is None or available_capital_per_position <= 0:
                 raise ValueError("Invalid or insufficient available capital per position.")
 
