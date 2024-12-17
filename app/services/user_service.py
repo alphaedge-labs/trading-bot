@@ -76,7 +76,8 @@ class UserService:
                 {
                     "$inc": {
                         "capital.available_balance": -amount,
-                        "capital.total_deployed": amount
+                        "capital.total_deployed": amount,
+                        "risk_management.open_positions": 1
                     },
                     "$push": {
                         "activity_logs": {
@@ -94,6 +95,7 @@ class UserService:
             # Update Redis
             user["capital"]["available_balance"] -= amount
             user["capital"]["total_deployed"] += amount
+            user["risk_management"]["open_positions"] += 1
             await self.redis_client.set_hash("users", user_id, user)
             
             # Update in-memory
@@ -120,7 +122,8 @@ class UserService:
                 {
                     "$inc": {
                         "capital.available_balance": amount + pnl,
-                        "capital.total_deployed": -amount
+                        "capital.total_deployed": -amount,
+                        "risk_management.open_positions": -1
                     },
                     "$push": {
                         "activity_logs": {
@@ -138,6 +141,7 @@ class UserService:
             # Update Redis
             user["capital"]["available_balance"] += (amount + pnl)
             user["capital"]["total_deployed"] -= amount
+            user["risk_management"]["open_positions"] -= 1
             await self.redis_client.set_hash("users", user_id, user)
             
             # Update in-memory

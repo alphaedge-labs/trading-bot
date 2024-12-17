@@ -35,6 +35,9 @@ async def test_block_capital_success(user_service):
         "capital": {
             "available_balance": 2000.0,
             "total_deployed": 1000.0
+        },
+        "risk_management": {
+            "open_positions": 0
         }
     }
     
@@ -58,6 +61,9 @@ async def test_release_capital_success(user_service):
         "capital": {
             "available_balance": 1000.0,
             "total_deployed": 2000.0
+        },
+        "risk_management": {
+            "open_positions": 1
         }
     }
     

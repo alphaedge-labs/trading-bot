@@ -23,11 +23,11 @@ class RiskManagement(BaseModel):
     stop_loss_buffer: float = Field(default=0.5, description="Percentage or points buffer for stop loss")
     position_sizing_method: str = Field(default="fixed", description="Options: fixed, percentage_of_capital")
     max_open_positions: int = Field(default=5, description="Limit on the number of active trades")
+    open_positions: int = Field(default=0, description="Number of open positions")
 
 class Capital(BaseModel):
     total_deployed: float
     available_balance: float
-    available_balance_per_position: float
 
 class TradingHours(BaseModel):
     start: str
