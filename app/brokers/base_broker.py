@@ -38,11 +38,11 @@ class BaseBroker(ABC):
         pass
 
     @abstractmethod
-    def form_order(self, data: Dict[str, Any], is_exit: bool):
+    async def form_order(self, data: Dict[str, Any], is_exit: bool):
         """Form an order"""
         pass
 
     @abstractmethod
-    def place_order(self, order: Dict[str, Any]):
+    async def place_order(self, order: Dict[str, Any]):
         """Place an order"""
         pass

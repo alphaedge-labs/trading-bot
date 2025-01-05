@@ -33,11 +33,11 @@ services:
         deploy:
             resources:
                 limits:
-                    cpus: "0.5" # Use half of the available CPU
-                    memory: 256M # Limit memory to 256 MB
+                    cpus: "0.75"
+                    memory: 512M
                 reservations:
-                    cpus: "0.25" # Reserve 25% of the available CPU
-                    memory: 128M # Reserve 128 MB memory
+                    cpus: "0.5"
+                    memory: 256M
 
 networks:
     alphaedge__network:

@@ -39,11 +39,11 @@ class RedisClient:
                     self.client = await aioredis.Redis(**self.redis_params)
                 await self.client.ping()
                 self.pubsub = self.client.pubsub()
-                redis_logger.info("Connected to Redis!!!")
+                redis_logger.success("Connected to Redis!!!")
                 return
             except (aioredis.ConnectionError, ConnectionRefusedError):
                 retries += 1
-                redis_logger.info(f"Attempt {retries} to reconnect...")
+                redis_logger.warning(f"Attempt {retries} to reconnect...")
                 sleep(retries * 0.5)
         raise Exception("Too many retries.")
 
@@ -88,6 +88,10 @@ class RedisClient:
         data = await self.client.hget(category, identifier)
         return json.loads(data) if data else None
 
+    async def get_hash_by_key(self, category, key):
+        data = await self.client.hget(category, key)
+        return json.loads(data) if data else None
+
     # Delete a hash
     async def delete_hash(self, category, key):
         await self.client.hdel(category, key)
@@ -113,7 +117,7 @@ class RedisClient:
     async def publish(self, channel: str, message: str):
         """Publish a message to a channel"""
         await self.client.publish(channel, message)
-        logger.info(f"Published message to channel: {channel}")
+        logger.info(f"Published message to channel: {channel}: {message}")
 
     def get_pubsub(self):
         """Get a pubsub instance"""
@@ -126,7 +130,7 @@ class RedisClient:
                 await self.pubsub.close()
             if self.client:
                 await self.client.close()
-            redis_logger.info("Disconnected from Redis")
+            redis_logger.success("Disconnected from Redis")
         except Exception as e:
             redis_logger.error(f"Error disconnecting from Redis: {e}")
 

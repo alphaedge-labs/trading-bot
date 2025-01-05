@@ -6,6 +6,7 @@ from config import (
     MONGO_DB
 )
 from utils.logging import logger
+from database.manager import DatabaseManager
 
 mongo_logger = logger.bind(name="mongodb")
 
@@ -26,11 +27,11 @@ class AsyncMongoDBClient:
         while retries < self.max_retries:
             try:
                 await self.client.admin.command('ping')
-                mongo_logger.info("Connected to MongoDB!!!")
+                mongo_logger.success("Connected to MongoDB!!!")
                 return
             except ConnectionFailure:
                 retries += 1
-                mongo_logger.info(f"Attempt {retries} to reconnect...")
+                mongo_logger.warning(f"Attempt {retries} to reconnect...")
                 await asyncio.sleep(retries * 0.5)
         raise Exception("Too many retries.")
 
@@ -41,10 +42,12 @@ class AsyncMongoDBClient:
 # Create the client instance
 mongo_client = AsyncMongoDBClient(db_name=MONGO_DB)
 
-# Initialize database connection asynchronously
-async def init_db():
-    global db
-    db = await mongo_client.get_database()
-
 # Initializing db needs to be done in an async context
 db = None
+
+# Initialize database connection asynchronously
+async def init_db():
+    db = await mongo_client.get_database()
+    DatabaseManager.set_db(db)
+    logger.success("Database initialized and set in DatabaseManager")
+    return db

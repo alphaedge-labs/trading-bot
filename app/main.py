@@ -8,10 +8,14 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from utils.datetime import get_ist_time
 
-from database.mongodb import init_db
 from services.signal_processing_service import SignalProcessingService
 from services.trading_service import TradingService
 from services.user_service import UserService
+from services.order_service import OrderService
+
+from database.mongodb import init_db
+
+from routes.zerodha_kite import router as zerodha_router
 
 from config import PORT
 
@@ -58,9 +62,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, debug=True)
 
+app.include_router(zerodha_router, prefix="/trading/v1/brokers/zerodha")
+
 @app.get("/health")
 def health_check():
     return {"status": "running", "message": "AlphaEdge Trading Bot is running", "datetime": get_ist_time()}
+
+async def start_fastapi():
+    """Run the FastAPI app in the same event loop."""
+    config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
+    server = uvicorn.Server(config)
+    logger.info(f"Starting FastAPI server on port {PORT}")
+    await server.serve()
 
 async def main():
     # Store all services that need cleanup
@@ -77,41 +90,41 @@ async def main():
         await user_service.initialize()
         services['user_service'] = user_service
 
+        # Start the FastAPI app
+        fastapi_task = asyncio.create_task(start_fastapi())
+
         trading_service = TradingService(user_service=user_service)
         await trading_service.start()
         services['trading_service'] = trading_service
 
+        order_service = OrderService(user_service=user_service)
+        services['order_service'] = order_service
+
         signal_processing_service = SignalProcessingService(
             user_service=user_service, 
-            trading_service=trading_service
+            trading_service=trading_service,
+            order_service=order_service
         )
         await signal_processing_service.start()
         services['signal_processing_service'] = signal_processing_service
-
+        
+        
         # add services to app state
         app.state.user_service = user_service
         app.state.trading_service = trading_service
         app.state.signal_processing_service = signal_processing_service
-
-        config = uvicorn.Config(
-            app=app,
-            host="0.0.0.0",
-            port=PORT,
-            loop="asyncio"
-        )
-        server = uvicorn.Server(config)
-        fastapi_task = loop.create_task(server.serve())
+        app.state.order_service = order_service
 
         # Wait indefinitely until interrupted
         await asyncio.Event().wait()
         
     except KeyboardInterrupt:
-        logger.info("Received keyboard interrupt, initiating shutdown...")
+        logger.warning("Received keyboard interrupt, initiating shutdown...")
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         raise
     finally:
-        logger.info("Shutting down services...")
+        logger.warning("Shutting down services...")
         
         # Cleanup FastAPI
         if 'fastapi_task' in locals():
@@ -130,6 +143,10 @@ async def main():
             logger.info("Stopping trading service...")
             await services['trading_service'].stop_listening()
 
+        if 'order_service' in services:  # Add this block
+            logger.info("Stopping order service...")
+            await services['order_service'].stop()
+
         # Close Redis connections
         if 'redis_client' in services:
             logger.info("Closing Redis connections...")
@@ -138,13 +155,13 @@ async def main():
         # Close MongoDB connection (if needed)
         # Add any other cleanup needed
 
-        logger.info("Shutdown complete")
+        logger.success("Shutdown complete")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Received keyboard interrupt in main thread")
+        logger.error("Received keyboard interrupt in main thread")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
         raise

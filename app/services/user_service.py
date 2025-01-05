@@ -3,26 +3,27 @@ from datetime import datetime
 from loguru import logger
 
 from database.redis import redis_client
-from database.mongodb import db
 from constants.collections import Collections
-
+from database.manager import DatabaseManager
 class UserService:
     def __init__(self):
         self.redis_client = redis_client.get_new_connection()
         self.users: Dict[str, dict] = {}
+        self.db_manager = DatabaseManager()
+        self.db = None
         
     async def initialize(self):
         """Load all active users into memory and Redis"""
         try:
-            from database.mongodb import db
-            self.users_collection = db[Collections.USERS.value]
+            self.db = await self.db_manager.get_db()
+            self.users_collection = self.db[Collections.USERS.value]
             active_users = await self.users_collection.find({"is_active": True}).to_list(length=None)
             for user in active_users:
                 user_id = user["_id"]
                 self.users[user_id] = user
                 # Cache in Redis
                 await self.redis_client.set_hash("users", user_id, user)
-            logger.info(f"Initialized {len(self.users)} active users")
+            logger.success(f"Initialized {len(self.users)} active users")
         except Exception as e:
             logger.error(f"Error initializing users: {e}")
             raise
@@ -38,7 +39,7 @@ class UserService:
             user = await self.redis_client.get_hash("users", user_id)
             if not user:
                 # Fallback to MongoDB
-                user = await self.users_collection.find_one({"_id": user_id})
+                user = await self.db[Collections.USERS.value].find_one({"_id": user_id})
                 if user:
                     # Cache in Redis for next time
                     await self.redis_client.set_hash("users", user_id, user)
@@ -68,7 +69,7 @@ class UserService:
                 return False
 
             # Update MongoDB
-            result = await self.users_collection.update_one(
+            result = await self.db[Collections.USERS.value].update_one(
                 {
                     "_id": user_id,
                     "capital.available_balance": {"$gte": amount}  # Double-check balance
@@ -101,14 +102,14 @@ class UserService:
             # Update in-memory
             self.users[user_id] = user
 
-            logger.info(f"Successfully blocked {amount} capital for user {user_id}")
+            logger.success(f"Successfully blocked {amount} capital for user {user_id}")
             return True
 
         except Exception as e:
             logger.error(f"Error blocking capital for user {user_id}: {e}")
             return False
 
-    async def release_capital(self, user_id: str, amount: float, pnl: float) -> bool:
+    async def release_capital(self, user_id: str, amount: float, pnl: float, remark: str = None) -> bool:
         """Release blocked capital and update with PnL"""
         try:
             user = await self.get_user(user_id)
@@ -116,8 +117,16 @@ class UserService:
                 logger.error(f"User {user_id} not found")
                 return False
 
+            update_log = {
+                "timestamp": datetime.now(),
+                "activity": f"Released capital: {amount}, PnL: {pnl}"
+            }
+
+            if remark:
+                update_log["remark"] = remark
+
             # Update MongoDB
-            result = await self.users_collection.update_one(
+            result = await self.db[Collections.USERS.value].update_one(
                 {"_id": user_id},
                 {
                     "$inc": {
@@ -126,10 +135,7 @@ class UserService:
                         "risk_management.open_positions": -1
                     },
                     "$push": {
-                        "activity_logs": {
-                            "timestamp": datetime.now(),
-                            "activity": f"Released capital: {amount}, PnL: {pnl}"
-                        }
+                        "activity_logs": update_log
                     }
                 }
             )
@@ -147,7 +153,11 @@ class UserService:
             # Update in-memory
             self.users[user_id] = user
 
-            logger.info(f"Successfully released {amount} capital with PnL {pnl} for user {user_id}")
+            if pnl > 0:
+                logger.success(f"Successfully released {amount} capital with PnL {pnl} for user {user_id}")
+            else:
+                logger.error(f"Successfully released {amount} capital with PnL {pnl} for user {user_id}")
+            
             return True
 
         except Exception as e:
@@ -167,7 +177,7 @@ class UserService:
         """Update user settings"""
         try:
             # Update MongoDB
-            result = await self.users_collection.update_one(
+            result = await self.db[Collections.USERS.value].update_one(
                 {"_id": user_id},
                 {"$set": settings}
             )
