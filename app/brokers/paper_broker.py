@@ -2,7 +2,10 @@ from typing import Dict, Any
 from datetime import datetime
 
 from brokers.base_broker import BaseBroker
+
 from constants.brokers import Broker
+from constants.orders import TransactionType, OrderType, Validity, Variety, Product, Exchange
+
 from utils.logging import logger
 from utils.id_generator import generate_id
 
@@ -14,30 +17,36 @@ class PaperBroker(BaseBroker):
             
         self.client_id = client_id
         self.client_secret = client_secret
-        logger.info(f"PaperBroker initialized for client: {client_id}")
+        logger.success(f"PaperBroker initialized for client: {client_id}")
+        self.authenticated = False
 
-    def form_order(self, data: Dict[str, Any], is_exit: bool = False) -> Dict[str, Any]:
+    def login(self, mobilenumber: str, password: str):
+        self.authenticated = True
+        return {"status": "success", "message": "Logged in successfully"}
+
+    async def form_order(self, data: Dict[str, Any], is_exit: bool = False) -> Dict[str, Any]:
         """
         Forms an order for paper trading
         """
         # If it's an exit order, flip the transaction type
-        transaction_type = data.get("transaction_type", "BUY")
+        transaction_type = data.get("transaction_type", TransactionType.BUY.value)
+
         if is_exit:
-            transaction_type = "SELL" if transaction_type == "BUY" else "BUY"
+            transaction_type = TransactionType.SELL.value if transaction_type == TransactionType.BUY.value else TransactionType.BUY.value
 
         order = {
             "symbol": data["symbol"],
             "quantity": data["quantity"],
             "transaction_type": transaction_type,
-            "product": data.get("product", "MIS"),
-            "order_type": data.get("order_type", "LIMIT"),
-            "price": data.get("entry_price" if not is_exit else "current_price"),
+            "product": data.get("product", Product.MIS.value),
+            "order_type": OrderType.MARKET.value if is_exit else OrderType.LIMIT.value,
+            "price": data.get("entry_price"),
             "trigger_price": data.get("stop_loss"),
             "disclosed_quantity": 0,
-            "validity": "DAY",
-            "variety": "REGULAR",
+            "validity": Validity.DAY.value,
+            "variety": Variety.REGULAR.value,
             "user_id": self.client_id,
-            "exchange": data.get("exchange", "NSE"),
+            "exchange": data.get("exchange", Exchange.NFO.value),
             "timestamp": datetime.now().isoformat()
         }
 
@@ -55,6 +64,10 @@ class PaperBroker(BaseBroker):
         """
         Simulates order placement for paper trading
         """
+
+        if not self.authenticated:
+            raise Exception("Not authenticated. Please login first.")
+
         try:
             # Simulate successful order placement
             order_result = {
@@ -74,7 +87,7 @@ class PaperBroker(BaseBroker):
             }
             
             # logger.info(f"Paper trade order placed successfully: {order_result}")
-            return order_result
+            return order_result["order_id"]
             
         except Exception as e:
             logger.error(f"Error placing paper trade order: {e}")
@@ -82,26 +95,47 @@ class PaperBroker(BaseBroker):
 
     # Other required methods with basic implementations
     def get_open_positions(self):
+        if not self.authenticated:
+            raise Exception("Not authenticated. Please login first.")
+        
         return []
 
     def get_closed_positions(self):
+        if not self.authenticated:
+            raise Exception("Not authenticated. Please login first.")
+        
         return []
 
     def get_open_orders(self):
+        if not self.authenticated:
+            raise Exception("Not authenticated. Please login first.")
+        
         return []
 
     def get_order_history(self):
+        if not self.authenticated:
+            raise Exception("Not authenticated. Please login first.")
+        
         return []
 
     def get_account_details(self):
+        if not self.authenticated:
+            raise Exception("Not authenticated. Please login first.")
+        
         return {
             "client_id": self.client_id,
             "balance": 1000000  # Simulated balance for paper trading
         }
 
     def get_required_margin(self, order: Dict[str, Any]):
+        if not self.authenticated:
+            raise Exception("Not authenticated. Please login first.")
+        
         return 0  # No margin requirements for paper trading
 
     def cancel_order(self, order_id: str):
-        logger.info(f"Cancelling paper trade order: {order_id}")
+        if not self.authenticated:
+            raise Exception("Not authenticated. Please login first.")
+        
+        logger.warning(f"Cancelling paper trade order: {order_id}")
         return {"status": "success", "message": "Order cancelled"}

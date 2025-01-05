@@ -3,7 +3,7 @@ import asyncio
 from loguru import logger
 from datetime import datetime
 
-from database.mongodb import db
+from database.manager import DatabaseManager
 from database.redis import redis_client
 
 from services.user_service import UserService
@@ -12,12 +12,11 @@ from constants.collections import Collections
 from constants.brokers import Broker
 from constants.redis import HashSets
 from constants.positions import PositionStatus
+from constants.orders import OrderStatus, Exchange
 
 from brokers.kotak_neo import KotakNeo
 from brokers.paper_broker import PaperBroker
-
-from utils.id_generator import generate_id
-from utils.datetime import _parse_datetime
+from brokers.zerodha_kite import ZerodhaKite
 
 class TradingService:
     def __init__(self, user_service: UserService):
@@ -27,6 +26,8 @@ class TradingService:
         self.channels = ["positions"]
         self.running = False
         self.broker_clients = {}
+        self.db_manager = DatabaseManager()
+        self.db = None
 
     async def start(self):
         """Get all active users and initialize broker clients"""
@@ -44,20 +45,35 @@ class TradingService:
                             client_id=user["_id"],
                             client_secret=user["email"]
                         )
+                        self.broker_clients[user_id][Broker.PAPER_BROKER.value].login(
+                            mobilenumber=broker_config["TRADING_CLIENT_ID"],
+                            password=broker_config["TRADING_PASSWORD"]
+                        )
                         
                     elif broker_config["TRADING_BROKER"] == Broker.KOTAK_NEO.value:
                         self.broker_clients[user_id][Broker.KOTAK_NEO.value] = KotakNeo(
-                            client_id=user["_id"],
-                            client_secret=user["email"]
+                            client_id=broker_config["TRADING_APP_KEY"],
+                            client_secret=broker_config["TRADING_SECRET_KEY"],
+                            neo_fin_key=broker_config["TRADING_FIN_KEY"]
                         )
-
+                        self.broker_clients[user_id][Broker.KOTAK_NEO.value].login(
+                            mobilenumber=broker_config["TRADING_CLIENT_ID"],
+                            password=broker_config["TRADING_PASSWORD"]
+                        )
+                    
+                    elif broker_config["TRADING_BROKER"] == Broker.ZERODHA_KITE.value:
+                        self.broker_clients[user_id][Broker.ZERODHA_KITE.value] = ZerodhaKite(
+                            client_id=broker_config["TRADING_APP_KEY"],
+                            client_secret=broker_config["TRADING_SECRET_KEY"],
+                            access_token=broker_config["TRADING_ACCESS_TOKEN"]
+                        )
+                        await self.broker_clients[user_id][Broker.ZERODHA_KITE.value].login()
+                        
         logger.info(f"Initialized broker clients for {len(self.broker_clients)} users")
         self.running = True
 
-        from database.mongodb import db
-        self.positions_collection = db[Collections.CLOSED_POSITIONS.value]
-        self.users_collection = db[Collections.USERS.value]
-
+        self.db = await self.db_manager.get_db()
+    
     def get_broker_client(self, user_id: str, broker_name: str):
         """Helper method to get specific broker client for a user"""
         if user_id not in self.broker_clients:
@@ -83,62 +99,57 @@ class TradingService:
                 logger.error(f"Position {position_id} not found to manage")
                 return
             
-            logger.info(f"user_id: {user_id}, position_id: {position_id}, pnl: {position_data['unrealized_pnl']}")
+            pnl = position_data['unrealized_pnl']
+            if pnl > 0:
+                logger.success(f'Pnl for user {user_id}: {pnl}')
+            else:
+                logger.error(f'Pnl for user {user_id}: {pnl}')
 
             if position_data.get("should_exit") == True:
                 # Get the appropriate broker client
+
+
                 broker_client = self.get_broker_client(user_id, position_data["broker"])
                 if not broker_client:
                     return
-                    
+                
                 # Place exit order
-                exit_order = broker_client.form_order(position_data, True)
+                exit_order = await broker_client.form_order(position_data, True)
+
                 try:
                     # Place the exit order
-                    order_result = await broker_client.place_order(exit_order)
+                    order_id = await broker_client.place_order(exit_order)
+
+                    if not order_id:
+                        logger.error(f"Failed to place exit order for position {position_id}")
+                        return
                     
-                    # Release blocked capital
-                    blocked_capital = float(position_data.get("blocked_capital", 0))
+                    logger.success(f'Placed exit order for user {user_id}')
 
-                    # Calculate realized P&L
-                    entry_price = float(position_data["entry_price"])
-                    exit_price = float(order_result["average_price"])
-                    quantity = float(position_data["quantity"])
-                    realized_pnl = (exit_price - entry_price) * quantity
-
-                    # Store closed position in MongoDB
-                    closed_position = {
-                        **position_data,
-                        "_id": f"clpos_{generate_id()}",
-                        "exit_price": exit_price,
-                        "exit_time": datetime.now(),
-                        "timestamp": _parse_datetime(position_data["timestamp"]),
-                        "last_updated": _parse_datetime(position_data["last_updated"]),
-                        "realized_pnl": realized_pnl,
-                        "order_result": order_result,
-                        "status": "CLOSED"
+                    order_to_insert = {
+                        **exit_order,
+                        "identifier": self.redis_client._generate_key(exit_order),
+                        "order_id": order_id,
+                        "position_id": position_id,
+                        "user_id": user_id,
+                        "broker": position_data.get("broker"),
+                        "status": OrderStatus.PENDING.value,
+                        "exchange": Exchange.NFO.value,
+                        "is_exit": True
                     }
 
-                    await self.positions_collection.insert_one(closed_position)
-                    # Release blocked capital and update capital with realized PnL
-                    await self.user_service.release_capital(
-                        user_id=position_data["user_id"],
-                        amount=blocked_capital,
-                        pnl=realized_pnl
-                    )
+                    if order_to_insert.get("broker") == Broker.PAPER_BROKER.value:
+                        await asyncio.gather(
+                            self.redis_client.set_hash(HashSets.ORDERS_PENDING.value, order_id, order_to_insert),
+                            self._update_redis_mapping(
+                                HashSets.ORDER_ID_MAPPING.value,
+                                order_to_insert["identifier"],
+                                order_id
+                            )
+                        )
 
-                    identifier = self.redis_client._generate_key(position_data)
-                    await asyncio.gather(
-                        # Remove from positions hash
-                        self.redis_client.delete_hash(HashSets.POSITIONS.value, position_id),
-                        # Clean up position ID mapping
-                        self._cleanup_mapping(HashSets.POSITION_ID_MAPPINGS, identifier, position_id),
-                        # Clean up position user mapping
-                        self._cleanup_mapping(HashSets.POSITION_USER_MAPPINGS, position_data["user_id"], position_id)
-                    )
-                    
-                    logger.info(f"Closed position {position_id} for user {user_id} with P&L: {realized_pnl}")
-                    
+                    await self.db[Collections.ORDERS.value].insert_one(order_to_insert)
+
                 except Exception as e:
                     logger.error(f"Error executing exit order for position {position_id}: {e}")
                     # Mark position as failed_exit
@@ -158,51 +169,20 @@ class TradingService:
         except Exception as e:
             logger.error(f"Error managing position {position_id}: {e}")
 
-    async def _cleanup_mapping(self, hash_set: HashSets, key: str, position_id: str):
-        """Helper method to clean up Redis hash mappings"""
-        try:
-            mapping = await self.redis_client.get_hash(hash_set.value, key) or []
-            mapping_set = set(mapping)
-            mapping_set.discard(position_id)
-            mapping_list = list(mapping_set)
-
-            if mapping_list:
-                await self.redis_client.set_hash(hash_set.value, key, mapping_list)
-            else:
-                await self.redis_client.delete_hash(hash_set.value, key)
-        except Exception as e:
-            logger.error(f"Error cleaning up mapping for {hash_set.value}/{key}: {e}")
-
-    async def manage_risk(self, data):
-        """Manage risk for a user"""
-        try:
-            user_id = data.get("user_id")
-            user = await self.user_service.get_user(user_id)
-            
-            if not user:
-                logger.error(f"User {user_id} not found")
-                return
-            
-            # Get all open positions for user
-            positions_keys = await self.redis_client.get_hash(HashSets.POSITION_USER_MAPPINGS.value, user_id) or []
-            total_risk = 0
-            
-            for position_key in positions_keys:
-                position = await self.redis_client.get_hash(HashSets.POSITIONS.value, position_key)
-                if not position:
-                    continue
-                unrealized_pnl = float(position.get("unrealized_pnl", 0))
-                total_risk += abs(unrealized_pnl)
-                
-            # Check if total risk exceeds user's risk limits
-            max_risk = user.get("risk_management", {}).get("max_risk_per_day", float('inf'))
-            
-            if total_risk > max_risk:
-                logger.warning(f"Risk limit exceeded for user {user_id}. Closing all positions.")
-                await self.exit_all_positions()
-                
-        except Exception as e:
-            logger.error(f"Error managing risk: {e}")
+    async def _update_redis_mapping(self, hash_set: str, key: str, value: str):
+        """
+        Update a Redis hash set mapping by adding a new value to the existing set
+        
+        Args:
+            hash_set (str): The Redis hash set to update
+            key (str): The key within the hash set
+            value (str): The value to add to the set
+        """
+        mapping = await self.redis_client.get_hash(hash_set, key) or []
+        mapping_set = set(mapping)
+        mapping_set.add(value)
+        mapping = list(mapping_set)
+        await self.redis_client.set_hash(hash_set, key, mapping)
 
     async def start_listening(self):
         """Start listening to Redis channels"""
@@ -274,7 +254,7 @@ class TradingService:
     async def stop_listening(self):
         """Gracefully stop the service"""
 
-        logger.info("Stopping trading service...")
+        logger.warning("Stopping trading service...")
         all_user_ids = await self.redis_client.get_all_keys(HashSets.POSITION_USER_MAPPINGS.value)
         for user_id in all_user_ids:
             logger.info(f"Exiting all positions for user {user_id}")
@@ -299,6 +279,22 @@ class TradingService:
             logger.info("Trading service stopped")
         except Exception as e:
             logger.error(f"Error stopping trading service: {e}")
+
+    async def _remove_position_mappings(self, position_id: str, user_id: str, identifier: str):
+        """Remove position from all mappings"""
+        try:
+            # Remove from position-user mapping
+            user_positions = await self.redis_client.get_hash(HashSets.POSITION_USER_MAPPINGS.value, user_id) or []
+            user_positions = [pos for pos in user_positions if pos != position_id]
+            await self.redis_client.set_hash(HashSets.POSITION_USER_MAPPINGS.value, user_id, user_positions)
+
+            # Remove from position-id mapping
+            position_ids = await self.redis_client.get_hash(HashSets.POSITION_ID_MAPPINGS.value, identifier) or []
+            position_ids = [pos for pos in position_ids if pos != position_id]
+            await self.redis_client.set_hash(HashSets.POSITION_ID_MAPPINGS.value, identifier, position_ids)
+
+        except Exception as e:
+            logger.error(f"Error removing position mappings: {e}")
 
     async def exit_all_positions_for_user(self, user_id: str):
         """Exit all open positions for a specific user"""
