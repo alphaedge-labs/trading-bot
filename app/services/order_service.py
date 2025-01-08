@@ -147,11 +147,16 @@ class OrderService:
                 'exit_price': exit_price,
                 'unrealized_pnl': 0,
                 'realized_pnl': pnl,
-                'closed_at': datetime.now().isoformat()
+                'closed_at': datetime.now(),
+                "created_at": datetime.strptime(position.get("created_at"), "%a %b  %d %H:%M:%S %Y"),
+                "last_updated": datetime.strptime(position.get("last_updated"), "%a %b  %d %H:%M:%S %Y"),
+                "timestamp": datetime.strptime(position.get("timestamp"), "%Y-%m-%dT%H:%M:%S.%f")
             })
 
             await self.db[Collections.CLOSED_POSITIONS.value].insert_one(position)
             # Release blocked capital and update capital with realized PnL
+
+            logger.info(f'Storing closed position in db: {position}')
 
             await self.user_service.release_capital(
                 user_id=position.get("user_id"),
