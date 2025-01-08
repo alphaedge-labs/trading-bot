@@ -235,8 +235,8 @@ class SignalProcessingService:
                 return None
 
             order = {
-                "validity_ttl": 2,
-                "validity": Validity.TTL.value,
+                # "validity_ttl": 2,
+                "validity": Validity.DAY.value,
                 "variety": Variety.REGULAR.value,
                 "exchange": Exchange.NFO.value,
                 "product": Product.MIS.value,
